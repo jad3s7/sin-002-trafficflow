@@ -22,12 +22,19 @@ public class IngestionServiceApp {
         String signalType;
         Boolean active;
 
+        Intersection() {}
+
         Intersection(String id, String district, String signalType, Boolean active) {
             this.id = id;
             this.district = district;
             this.signalType = signalType;
             this.active = active;
         }
+
+        public String getId() { return id; }
+        public String getDistrict() { return district; }
+        public String getSignalType() { return signalType; }
+        public Boolean getActive() { return active; }
     }
 
     public static void main(String[] args) {
