@@ -45,6 +45,8 @@ public class RoutingService {
         IntersectionInfo toInfo   = validateIntersection(request.to);
         int congestionLevel       = getCongestionLevel();
 
+//        int estimatedTravelTime = baseTime + (congestionLevel * 2);
+
         // ETA = base + congestion term + validity term
         int congestionMinutes = congestionLevel * MINUTES_PER_CONGESTION_LEVEL;
         int validityMinutes   = fromInfo.penaltyMinutes + toInfo.penaltyMinutes;
