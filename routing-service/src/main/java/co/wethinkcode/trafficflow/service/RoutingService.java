@@ -104,6 +104,7 @@ public class RoutingService {
      *   "penaltyMinutes": <int>        -> added verbatim
      *   "delayMinutes":   <int>        -> added verbatim
      */
+
     private IntersectionInfo parseIntersection(String intersectionId, String body) {
         boolean closed = false;
         int penaltyMinutes = 0;
