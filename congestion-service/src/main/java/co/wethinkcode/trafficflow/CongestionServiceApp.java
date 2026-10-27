@@ -9,8 +9,17 @@ public class CongestionServiceApp {
 
         app.get("/health", ctx -> ctx.result("OK"));
 
-        // TODO (Tracks the city-wide Congestion Level (0-8).)
-        // Add domain endpoints for congestion-service here.
+        // Congestion level endpoint
+        app.get("/congestion-level", ctx -> {
+            CongestionLevel response = new CongestionLevel();
+            response.congestion_level = 4; // Simple integer between 0 and 8
+            ctx.status(200).json(response);
+        });
+    }
+
+    // Data class for congestion level response with public fields for Jackson serialization
+    public static class CongestionLevel {
+        public int congestion_level;
     }
 }
 
