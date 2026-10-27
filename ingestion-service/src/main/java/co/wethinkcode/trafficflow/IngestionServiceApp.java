@@ -6,6 +6,8 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
 
 public class IngestionServiceApp {
 
@@ -83,6 +85,20 @@ public class IngestionServiceApp {
                 );
                 cleanedRecords.add(record);
             }
+
+            // Line 4: Remove duplicates by normalizing IDs and comparing other fields
+            // Use a Map with normalized ID as key to automatically handle duplicates
+            // If the same ID appears again (with different casing), only keep one record
+            Map<String, Intersection> deduplicatedMap = new HashMap<>();
+            for (Intersection record : cleanedRecords) {
+                String normalizedId = record.id.toUpperCase();
+                // Only add if not already present (first occurrence wins)
+                if (!deduplicatedMap.containsKey(normalizedId)) {
+                    deduplicatedMap.put(normalizedId, record);
+                }
+            }
+            // Convert map values back to a list
+            List<Intersection> deduplicatedRecords = new ArrayList<>(deduplicatedMap.values());
 
         } catch (Exception e) {
             e.printStackTrace();
