@@ -66,16 +66,19 @@ public class IngestionServiceApp {
                 String rawSignalType = values.length > 2 ? values[2] : "";
                 String rawActiveFlag = values.length > 3 ? values[3] : "";
 
-                // Apply trimming to remove whitespace
-                String trimmedId = rawId.trim();
-                String trimmedDistrict = rawDistrict.trim();
-                String trimmedSignalType = rawSignalType.trim();
-                String trimmedActiveFlag = rawActiveFlag.trim();
+                // Apply trimming to remove whitespace (leading, trailing, and double spaces)
+                String trimmedId = trimAllSpaces(rawId);
+                String trimmedDistrict = trimAllSpaces(rawDistrict);
+                String trimmedSignalType = trimAllSpaces(rawSignalType);
+                String trimmedActiveFlag = trimAllSpaces(rawActiveFlag);
 
-                // Apply casing normalization (IDs to uppercase, names to title case)
+                // Check for empty strings and placeholder values in district and signal type fields
+                // before applying casing normalization - return null for these cases
+                String normalizedDistrict = isMissingOrPlaceholder(trimmedDistrict) ? null : toTitleCase(trimmedDistrict);
+                String normalizedSignalType = isMissingOrPlaceholder(trimmedSignalType) ? null : trimmedSignalType.toLowerCase();
+
+                // Apply casing normalization (IDs to uppercase)
                 String normalizedId = trimmedId.toUpperCase();
-                String normalizedDistrict = toTitleCase(trimmedDistrict);
-                String normalizedSignalType = trimmedSignalType.toLowerCase();
 
                 // Parse boolean flag using a mapping function
                 Boolean normalizedActive = normalizeBoolean(trimmedActiveFlag);
@@ -115,10 +118,28 @@ public class IngestionServiceApp {
 
         // Expose the cleaned data via REST endpoint for other services to consume
         app.get("/intersections", ctx -> ctx.json(finalCleanedData));
+    }
 
-        // TODO: read and clean src/main/resources/intersections-legacy.csv (intersections, districts, signal types data —
-        // trim whitespace, fix casing, normalize dates/booleans) and expose the
-        // cleaned records here for the other services to consume.
+    // Helper method to trim all spaces (leading, trailing, and double spaces)
+    private static String trimAllSpaces(String input) {
+        if (input == null) {
+            return null;
+        }
+        return input.trim().replaceAll("\\s+", " ");
+    }
+
+    // Helper method to check if a value is missing or a placeholder
+    // Returns true for empty strings, null, or known placeholder values
+    private static boolean isMissingOrPlaceholder(String value) {
+        if (value == null || value.isEmpty()) {
+            return true;
+        }
+        String normalized = value.toLowerCase();
+        return normalized.equals("unknown") ||
+               normalized.equals("n/a") ||
+               normalized.equals("tbd") ||
+               normalized.equals("-") ||
+               normalized.equals("nan");
     }
 
     // Helper method to convert string to title case
@@ -131,7 +152,7 @@ public class IngestionServiceApp {
 
     // Helper method to normalize boolean values
     private static Boolean normalizeBoolean(String flag) {
-        if (flag == null || flag.isEmpty()) {
+        if (isMissingOrPlaceholder(flag)) {
             return null;
         }
         String normalized = flag.toLowerCase();
@@ -140,10 +161,6 @@ public class IngestionServiceApp {
         }
         if (normalized.equals("n") || normalized.equals("no") || normalized.equals("0") || normalized.equals("false")) {
             return false;
-        }
-        // Handle unknown/placeholder values
-        if (normalized.equals("unknown") || normalized.equals("n/a") || normalized.equals("tbd")) {
-            return null;
         }
         return null;
     }
