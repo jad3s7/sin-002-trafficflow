@@ -11,6 +11,10 @@ import java.util.HashMap;
 
 public class IngestionServiceApp {
 
+    // Class-level variable to store the cleaned, deduplicated intersection data
+    // This allows the data to be accessible by the REST endpoint
+    private static List<Intersection> finalCleanedData = new ArrayList<>();
+
     // Simple data class to hold cleaned intersection record
     static class Intersection {
         String id;
@@ -100,9 +104,17 @@ public class IngestionServiceApp {
             // Convert map values back to a list
             List<Intersection> deduplicatedRecords = new ArrayList<>(deduplicatedMap.values());
 
+            // Line 5: Return the cleaned, deduplicated list
+            // Store the final cleaned and deduplicated data in the class-level variable
+            // so it can be accessed by the REST endpoint for other services to consume
+            finalCleanedData = deduplicatedRecords;
+
         } catch (Exception e) {
             e.printStackTrace();
         }
+
+        // Expose the cleaned data via REST endpoint for other services to consume
+        app.get("/intersections", ctx -> ctx.json(finalCleanedData));
 
         // TODO: read and clean src/main/resources/intersections-legacy.csv (intersections, districts, signal types data —
         // trim whitespace, fix casing, normalize dates/booleans) and expose the
