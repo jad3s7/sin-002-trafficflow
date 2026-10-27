@@ -64,6 +64,7 @@ public class RoutingService {
     // ------------------------------------------------------------------------
     // Intersection lookup
     // ------------------------------------------------------------------------
+//    private void validateIntersection(String intersectionId) { ... }
     private IntersectionInfo validateIntersection(String intersectionId) {
         HttpRequest httpRequest = HttpRequest.newBuilder()
                 .uri(URI.create(intersectionServiceUrl + "/intersections/" + intersectionId))
