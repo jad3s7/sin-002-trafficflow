@@ -4,8 +4,25 @@ import io.javalin.Javalin;
 import java.io.InputStream;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.List;
 
 public class IngestionServiceApp {
+
+    // Simple data class to hold cleaned intersection record
+    static class Intersection {
+        String id;
+        String district;
+        String signalType;
+        Boolean active;
+
+        Intersection(String id, String district, String signalType, Boolean active) {
+            this.id = id;
+            this.district = district;
+            this.signalType = signalType;
+            this.active = active;
+        }
+    }
 
     public static void main(String[] args) {
         Javalin app = Javalin.create().start(7020);
@@ -22,11 +39,84 @@ public class IngestionServiceApp {
         // Wrapped the InputStream in a BufferedReader to read the file line by line
         // Read the first line (header) and split it by comma to get column names
         BufferedReader reader = new BufferedReader(new InputStreamReader(csvStream));
-        String headerLine = reader.readLine();
-        String[] columnNames = headerLine.split(",");
+        try {
+            String headerLine = reader.readLine();
+            String[] columnNames = headerLine.split(",");
+
+            // Line 3: For each data row:
+            // Extract raw values for intersection_id, district, signal_type, active_flag
+            // Apply trimming to remove whitespace
+            // Apply casing normalization (IDs to uppercase, names to title case)
+            // Parse boolean flag using a mapping function
+            // Store cleaned record in a collection
+            List<Intersection> cleanedRecords = new ArrayList<>();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] values = line.split(",");
+
+                // Extract raw values (handling potential array index issues)
+                String rawId = values.length > 0 ? values[0] : "";
+                String rawDistrict = values.length > 1 ? values[1] : "";
+                String rawSignalType = values.length > 2 ? values[2] : "";
+                String rawActiveFlag = values.length > 3 ? values[3] : "";
+
+                // Apply trimming to remove whitespace
+                String trimmedId = rawId.trim();
+                String trimmedDistrict = rawDistrict.trim();
+                String trimmedSignalType = rawSignalType.trim();
+                String trimmedActiveFlag = rawActiveFlag.trim();
+
+                // Apply casing normalization (IDs to uppercase, names to title case)
+                String normalizedId = trimmedId.toUpperCase();
+                String normalizedDistrict = toTitleCase(trimmedDistrict);
+                String normalizedSignalType = trimmedSignalType.toLowerCase();
+
+                // Parse boolean flag using a mapping function
+                Boolean normalizedActive = normalizeBoolean(trimmedActiveFlag);
+
+                // Store cleaned record in a collection
+                Intersection record = new Intersection(
+                    normalizedId,
+                    normalizedDistrict,
+                    normalizedSignalType,
+                    normalizedActive
+                );
+                cleanedRecords.add(record);
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
 
         // TODO: read and clean src/main/resources/intersections-legacy.csv (intersections, districts, signal types data —
         // trim whitespace, fix casing, normalize dates/booleans) and expose the
         // cleaned records here for the other services to consume.
+    }
+
+    // Helper method to convert string to title case
+    private static String toTitleCase(String input) {
+        if (input == null || input.isEmpty()) {
+            return null;
+        }
+        return input.substring(0, 1).toUpperCase() + input.substring(1).toLowerCase();
+    }
+
+    // Helper method to normalize boolean values
+    private static Boolean normalizeBoolean(String flag) {
+        if (flag == null || flag.isEmpty()) {
+            return null;
+        }
+        String normalized = flag.toLowerCase();
+        if (normalized.equals("y") || normalized.equals("yes") || normalized.equals("1") || normalized.equals("true")) {
+            return true;
+        }
+        if (normalized.equals("n") || normalized.equals("no") || normalized.equals("0") || normalized.equals("false")) {
+            return false;
+        }
+        // Handle unknown/placeholder values
+        if (normalized.equals("unknown") || normalized.equals("n/a") || normalized.equals("tbd")) {
+            return null;
+        }
+        return null;
     }
 }
