@@ -9,7 +9,14 @@ package co.wethinkcode.trafficflow;
 public final class MqConfig {
     private MqConfig() {}
 
-    public static final String BROKER_URL       = "tcp://localhost:61616";
-    public static final String CONGESTION_TOPIC = "congestion-topic";
-    public static final String HEARTBEAT_QUEUE  = "intersection-heartbeat-queue";
+    public static final String BROKER_URL = envOr("MQ_BROKER_URL", "tcp://localhost:61616");
+    public static final String CONGESTION_TOPIC =
+            envOr("MQ_CONGESTION_TOPIC", "congestion-topic");
+    public static final String HEARTBEAT_QUEUE =
+            envOr("MQ_HEARTBEAT_QUEUE", "intersection-heartbeat-queue");
+
+    private static String envOr(String name, String fallback) {
+        String value = System.getenv(name);
+        return value == null || value.isBlank() ? fallback : value;
+    }
 }

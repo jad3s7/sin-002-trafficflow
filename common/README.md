@@ -13,10 +13,13 @@ Routing Service becomes aware of congestion changes via an ActiveMQ Topic instea
 - Producer: `congestion-service` (`../congestion-service`)
 - Consumer(s): `routing-service` (`../routing-service`)
 
-Broker URL and topic name are shared via a common `co.wethinkcode.trafficflow.mq.MqConfig` class
-(`BROKER_URL`, `TOPIC`). It's identical in every participating service's own source
-tree — each service here is an independent Maven project with no shared parent pom,
-so the common package is duplicated rather than imported from one place.
+Broker URL and topic name are configured in each independent service's local
+`MqConfig` (`BROKER_URL`, `CONGESTION_TOPIC`) using `MQ_BROKER_URL` and
+`MQ_CONGESTION_TOPIC`. The copies are kept in sync because the Maven modules have
+no shared parent project.
+Congestion publishes persistent topic messages, and Routing uses a durable
+subscription so changes made while it is offline are delivered when it reconnects.
+Routing also reads the current congestion level once at startup to seed its cache.
 
 ### Queue: `intersection-heartbeat-queue`
 
@@ -26,8 +29,9 @@ missed heartbeats / dead-lettered messages instead of polling its `/health` endp
 - Producer: `intersection-service` (`../intersection-service`)
 - Consumer(s): `intersection-watchdog` (`../intersection-watchdog`)
 
-Broker URL and queue name are shared the same way, via each service's own copy of
-`co.wethinkcode.trafficflow.mq.MqConfig` (`BROKER_URL`, `HEARTBEAT_QUEUE`).
+Broker URL and queue name are shared the same way, via each service's local
+`MqConfig` (`BROKER_URL`, `HEARTBEAT_QUEUE`) using `MQ_BROKER_URL` and
+`MQ_HEARTBEAT_QUEUE`.
 
 ## Project structure
 
@@ -39,9 +43,9 @@ common/
 
 This folder holds the broker config and notes only — the actual publish/subscribe
 code belongs in the producer/consumer services listed above (their poms already
-depend on `activemq-client`, and each already has its own
-`src/main/java/co/wethinkcode/trafficflow/mq/MqConfig.java` with the constants for
-whichever topic/queue that service participates in).
+depend on `activemq-client`, and each has a local `MqConfig` class with the
+constants for the topic/queue that service participates in. The Maven source
+path differs for the watchdog copy, but all copies use the same Java package.
 
 ## Build
 
@@ -66,14 +70,18 @@ from their own directories at the project root).
 docker compose ps          # confirm the broker container is healthy
 ```
 
-Once the TODOs below are implemented, verify end-to-end by publishing a message from
-`congestion-service` and confirming the consumer(s) receive it — e.g. via logs, or by
-watching the topic in the web console.
+For an end-to-end smoke check, update congestion and confirm Routing reports the
+new level in the `/route` response breakdown. Check `/alert` on Watchdog for the
+latest heartbeat and inject a test heartbeat dead letter to confirm it alerts.
 
-## TODO
+## Implemented message flows
 
-- Add `activemq-client` publish logic to `congestion-service` on its stage/state-change endpoint.
-- Add `activemq-client` subscriber logic to consumer service(s) above, replacing any
-  direct synchronous calls to `congestion-service`.
-- Add `activemq-client` heartbeat-publish logic to `intersection-service`.
-- Add `activemq-client` subscriber/alerting logic to `intersection-watchdog`.
+- `congestion-service` publishes level changes to `congestion-topic`; failed
+  publications are retried until the current level is delivered.
+- `routing-service` consumes congestion messages using a durable subscription
+  and has an HTTP mode for the required Stage 2 direct-call flow.
+- `intersection-service` publishes a non-persistent heartbeat every five seconds
+  by default (`MQ_HEARTBEAT_INTERVAL_SECONDS`).
+- `intersection-watchdog` detects a missed heartbeat after fifteen seconds by
+  default (`MQ_HEARTBEAT_TIMEOUT_SECONDS`) and observes heartbeat-related DLQ
+  entries without consuming messages from the broker's dead-letter queue.

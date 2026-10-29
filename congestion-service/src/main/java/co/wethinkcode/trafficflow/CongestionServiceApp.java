@@ -13,6 +13,9 @@ import javax.jms.Topic;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class CongestionServiceApp {
 
@@ -26,15 +29,23 @@ public class CongestionServiceApp {
     private static volatile Connection      mqConn     = null;
     private static volatile Session         mqSession  = null;
     private static volatile MessageProducer mqProducer = null;
+    private static volatile int lastPublishedLevel = -1;
+    private static ScheduledExecutorService publishRetryExec;
 
     public static void main(String[] args) {
-        // Best-effort connect at startup; publishLevel() retries if this
-        // failed and the broker came up later.
-        ensurePublisher();
+        // Publish the initial state and keep retrying if the broker is down.
+        publishPendingLevel();
+        publishRetryExec = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "congestion-publish-retry");
+            t.setDaemon(true);
+            return t;
+        });
+        publishRetryExec.scheduleWithFixedDelay(
+                CongestionServiceApp::publishPendingLevel, 2, 2, TimeUnit.SECONDS);
 
         // Clean shutdown so the broker sees the disconnect immediately.
         Runtime.getRuntime().addShutdownHook(new Thread(
-                CongestionServiceApp::closePublisher, "mq-shutdown"));
+                CongestionServiceApp::stopPublisher, "mq-shutdown"));
 
         Javalin app = Javalin.create().start(PORT);
 
@@ -115,7 +126,7 @@ public class CongestionServiceApp {
             System.out.println("[congestion] level " + previous + " -> " + newLevel
                     + " (" + describe(newLevel) + ")");
         }
-        boolean published = changed && publishLevel(newLevel);
+        boolean published = publishPendingLevel();
         return new PublishResult(changed, published);
     }
 
@@ -130,7 +141,7 @@ public class CongestionServiceApp {
             Session session = conn.createSession(false, Session.AUTO_ACKNOWLEDGE);
             Topic topic = session.createTopic(MqConfig.CONGESTION_TOPIC);
             MessageProducer producer = session.createProducer(topic);
-            producer.setDeliveryMode(DeliveryMode.NON_PERSISTENT);
+            producer.setDeliveryMode(DeliveryMode.PERSISTENT);
             mqConn     = conn;
             mqSession  = session;
             mqProducer = producer;
@@ -144,12 +155,16 @@ public class CongestionServiceApp {
         }
     }
 
-    private static boolean publishLevel(int newLevel) {
+    private static synchronized boolean publishPendingLevel() {
+        int levelToPublish = level;
+        if (lastPublishedLevel == levelToPublish) return true;
         if (!ensurePublisher()) return false;
         try {
-            TextMessage msg = mqSession.createTextMessage("{\"level\":" + newLevel + "}");
+            TextMessage msg = mqSession.createTextMessage(
+                    "{\"level\":" + levelToPublish + "}");
             mqProducer.send(msg);
-            System.out.println("[congestion] published {\"level\":" + newLevel
+            lastPublishedLevel = levelToPublish;
+            System.out.println("[congestion] published {\"level\":" + levelToPublish
                     + "} to " + MqConfig.CONGESTION_TOPIC);
             return true;
         } catch (JMSException e) {
@@ -157,6 +172,11 @@ public class CongestionServiceApp {
             closePublisher();  // force reconnect on next attempt
             return false;
         }
+    }
+
+    private static void stopPublisher() {
+        if (publishRetryExec != null) publishRetryExec.shutdownNow();
+        closePublisher();
     }
 
     private static synchronized void closePublisher() {

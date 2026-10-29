@@ -10,6 +10,10 @@ parent pom.
 By default, this service subscribes to the ActiveMQ topic `congestion-topic` —
 see [`../common/`](../common). Broker URL and topic name come from this module's
 `co.wethinkcode.trafficflow.MqConfig`.
+The subscription is durable, and congestion messages are persistent, so changes
+made while Routing is offline are delivered when it reconnects. Routing also
+loads the current congestion snapshot from Congestion Service after subscribing,
+which covers a fresh install before the durable subscription has existed.
 
 To run the required Stage 2 synchronous REST integration by itself, set
 `TRAFFICFLOW_CONGESTION_SOURCE=http` when starting this service. In that mode,

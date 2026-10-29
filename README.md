@@ -134,7 +134,7 @@ cd intersection-watchdog && mvn package && java -jar target/intersection-watchdo
 
 ## Test
 
-No automated tests exist yet (this is a scaffold). Each running service exposes
+No automated tests exist yet. Each running service exposes
 `/health`, so sanity-check manually:
 
 ```

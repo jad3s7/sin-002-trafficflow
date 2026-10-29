@@ -23,6 +23,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class RoutingServiceApp {
 
@@ -54,6 +57,7 @@ public class RoutingServiceApp {
     private static volatile Connection      mqConn;
     private static volatile Session         mqSession;
     private static volatile MessageConsumer mqConsumer;
+    private static ScheduledExecutorService subscriberRetryExec;
 
     public static void main(String[] args) {
         if (!CONGESTION_SOURCE.equals("mq") && !CONGESTION_SOURCE.equals("http")) {
@@ -62,6 +66,14 @@ public class RoutingServiceApp {
         }
         if (CONGESTION_SOURCE.equals("mq")) {
             startSubscriber();
+            subscriberRetryExec = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "congestion-subscriber-retry");
+                t.setDaemon(true);
+                return t;
+            });
+            subscriberRetryExec.scheduleWithFixedDelay(() -> {
+                if (mqConsumer == null) startSubscriber();
+            }, 5, 5, TimeUnit.SECONDS);
             Runtime.getRuntime().addShutdownHook(new Thread(
                     RoutingServiceApp::stopSubscriber, "mq-shutdown"));
         } else {
@@ -194,15 +206,17 @@ public class RoutingServiceApp {
 
     // --- MQ subscriber ---------------------------------------------------
 
-    private static void startSubscriber() {
+    private static synchronized void startSubscriber() {
         try {
             ActiveMQConnectionFactory cf = new ActiveMQConnectionFactory(
                     MqConfig.brokerUrl());
             Connection conn = cf.createConnection();
-            conn.start();
+            conn.setClientID("trafficflow-routing-service");
             Session session = conn.createSession(false, Session.AUTO_ACKNOWLEDGE);
             Topic topic = session.createTopic(MqConfig.CONGESTION_TOPIC);
-            MessageConsumer consumer = session.createConsumer(topic);
+            MessageConsumer consumer = session.createDurableSubscriber(
+                    topic, "routing-service-congestion-level");
+            conn.start();
 
             // Runs on ActiveMQ's dispatch thread. Writes only volatile
             // scalars; readers on Javalin threads see the latest value
@@ -238,7 +252,8 @@ public class RoutingServiceApp {
             mqConsumer = consumer;
 
             System.out.println("[routing] subscribed to " + MqConfig.CONGESTION_TOPIC
-                    + " at " + MqConfig.BROKER_URL);
+                    + " at " + MqConfig.BROKER_URL + " (durable)");
+            seedCongestionSnapshot();
         } catch (Exception e) {
             System.err.println("[routing] subscriber start failed: " + e.getMessage()
                     + " — routing-service will serve with stale congestion until"
@@ -247,9 +262,32 @@ public class RoutingServiceApp {
     }
 
     private static void stopSubscriber() {
+        if (subscriberRetryExec != null) subscriberRetryExec.shutdownNow();
         try { if (mqConsumer != null) mqConsumer.close(); } catch (Exception ignored) {}
         try { if (mqSession  != null) mqSession.close();  } catch (Exception ignored) {}
         try { if (mqConn     != null) mqConn.close();     } catch (Exception ignored) {}
+    }
+
+    /**
+     * A durable topic retains changes only after the durable subscription has
+     * first existed. Read a snapshot once after subscribing so a fresh install
+     * or a broker that was down during initial startup still has current state.
+     * A newer topic event wins if it arrives while this request is in flight.
+     */
+    private static void seedCongestionSnapshot() {
+        long requestStartedAt = System.currentTimeMillis();
+        try {
+            int snapshot = fetchCongestionLevel();
+            if (levelLastUpdatedAt <= requestStartedAt) {
+                level = snapshot;
+                levelLastUpdatedAt = System.currentTimeMillis();
+                System.out.println("[routing] initialized congestion snapshot = "
+                        + snapshot);
+            }
+        } catch (DependencyException e) {
+            System.err.println("[routing] congestion snapshot unavailable: "
+                    + e.getMessage());
+        }
     }
 
     // --- Intersection-service calls (unchanged) -------------------------

@@ -1,4 +1,4 @@
-package co.wethinkcode.trafficflow;
+package co.wethinkcode.trafficflow.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -16,7 +16,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-public class RoutingServiceApp {
+/**
+ * Stage 2 HTTP-only reference implementation. The packaged application is
+ * {@code co.wethinkcode.trafficflow.RoutingServiceApp}, which adds the Stage 3
+ * ActiveMQ subscriber for congestion updates.
+ */
+class Stage2RoutingService {
 
     private static final int    PORT              = 7023;
     private static final String INTERSECTION_BASE = "http://localhost:7021";
