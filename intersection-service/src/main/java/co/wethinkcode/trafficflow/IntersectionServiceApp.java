@@ -2,6 +2,16 @@ package co.wethinkcode.trafficflow;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
+import org.apache.activemq.ActiveMQConnectionFactory;
+
+import javax.jms.Connection;
+import javax.jms.DeliveryMode;
+import javax.jms.JMSException;
+import javax.jms.MessageProducer;
+import javax.jms.Queue;
+import javax.jms.Session;
+import javax.jms.TextMessage;
+
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -11,6 +21,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 public class IntersectionServiceApp {
@@ -27,6 +41,14 @@ public class IntersectionServiceApp {
     private static volatile Map<String, List<Intersection>> byDistrict    = new HashMap<>();
     private static volatile boolean                         loaded        = false;
 
+    // Heartbeat state — populated by the scheduler thread.
+    private static ScheduledExecutorService heartbeatExec;
+    private static volatile Connection      hbConn;
+    private static volatile Session         hbSession;
+    private static volatile MessageProducer hbProducer;
+    private static final AtomicLong lastHeartbeatAt     = new AtomicLong(0);
+    private static final AtomicLong lastHeartbeatFailAt = new AtomicLong(0);
+
     public static class Intersection {
         public String       id;
         public String       district;
@@ -37,6 +59,7 @@ public class IntersectionServiceApp {
     }
 
     public static void main(String[] args) {
+        // Bounded startup retry so start order doesn't matter in a demo.
         boolean ok = false;
         for (int attempt = 0; attempt < 3 && !ok; attempt++) {
             if (attempt > 0) {
@@ -49,9 +72,13 @@ public class IntersectionServiceApp {
                     + "use POST /refresh once ingestion is up");
         }
 
+        startHeartbeat();
+        Runtime.getRuntime().addShutdownHook(new Thread(
+                IntersectionServiceApp::stopHeartbeat, "heartbeat-shutdown"));
+
         Javalin app = Javalin.create().start(PORT);
 
-        // Catch-all error envelope.
+        // Error envelope (unchanged from Stage 2).
         app.exception(Exception.class, (e, ctx) -> {
             System.err.println("[intersection] unhandled exception: " + e);
             e.printStackTrace();
@@ -116,11 +143,98 @@ public class IntersectionServiceApp {
                         "error",     "ingestion unreachable or returned bad data"));
             }
         });
+
+        // Stage 4 debug endpoint — proves heartbeats are flowing without
+        // needing to attach a consumer.
+        app.get("/heartbeat", ctx -> {
+            long last = lastHeartbeatAt.get();
+            Map<String, Object> resp = new HashMap<>();
+            resp.put("intervalSeconds", MqConfig.HEARTBEAT_INTERVAL_SECONDS);
+            resp.put("timeoutSeconds",  MqConfig.HEARTBEAT_TIMEOUT_SECONDS);
+            resp.put("connected",       hbProducer != null);
+            if (last > 0) {
+                resp.put("lastPublishedAtMsAgo", System.currentTimeMillis() - last);
+            } else {
+                resp.put("lastPublishedAtMsAgo", null);
+                resp.put("warning", "no heartbeat published yet");
+            }
+            ctx.json(resp);
+        });
     }
 
-    private static void unavailable(io.javalin.http.Context ctx) {
-        ctx.status(503).json(Map.of("error", "intersection data not loaded"));
+    // --- Heartbeat publisher --------------------------------------------
+
+    private static void startHeartbeat() {
+        heartbeatExec = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "heartbeat-publisher");
+            t.setDaemon(true);
+            return t;
+        });
+        heartbeatExec.scheduleAtFixedRate(
+                IntersectionServiceApp::publishHeartbeat,
+                0,
+                MqConfig.HEARTBEAT_INTERVAL_SECONDS,
+                TimeUnit.SECONDS);
     }
+
+    /**
+     * Runs on the heartbeat thread every HEARTBEAT_INTERVAL_SECONDS.
+     * Synchronized so concurrent ticks (shouldn't happen, but defensive)
+     * can't fight over connect/close. Failures are logged at most once
+     * per minute so a down broker doesn't drown stdout.
+     */
+    private static synchronized void publishHeartbeat() {
+        try {
+            if (hbProducer == null) connectHeartbeat();
+            String body = String.format(
+                    "{\"service\":\"intersection-service\",\"ts\":%d,\"intersectionCount\":%d}",
+                    System.currentTimeMillis(), intersections.size());
+            TextMessage msg = hbSession.createTextMessage(body);
+            hbProducer.send(msg);
+            lastHeartbeatAt.set(System.currentTimeMillis());
+        } catch (Exception e) {
+            long now = System.currentTimeMillis();
+            if (now - lastHeartbeatFailAt.get() > 60_000L) {
+                System.err.println("[heartbeat] publish failed: " + e.getMessage()
+                        + " — broker at " + MqConfig.BROKER_URL + " unreachable?");
+                lastHeartbeatFailAt.set(now);
+            }
+            closeHeartbeat();  // force fresh connect on next tick
+        }
+    }
+
+    private static void connectHeartbeat() throws JMSException {
+        ActiveMQConnectionFactory cf = new ActiveMQConnectionFactory(MqConfig.BROKER_URL);
+        Connection conn = cf.createConnection();
+        conn.start();
+        Session session = conn.createSession(false, Session.AUTO_ACKNOWLEDGE);
+        Queue queue = session.createQueue(MqConfig.HEARTBEAT_QUEUE);
+        MessageProducer producer = session.createProducer(queue);
+        // Non-persistent: heartbeats are useless after they age out.
+        producer.setDeliveryMode(DeliveryMode.NON_PERSISTENT);
+        hbConn     = conn;
+        hbSession  = session;
+        hbProducer = producer;
+        System.out.println("[heartbeat] connected to " + MqConfig.BROKER_URL
+                + " queue=" + MqConfig.HEARTBEAT_QUEUE
+                + " interval=" + MqConfig.HEARTBEAT_INTERVAL_SECONDS + "s");
+    }
+
+    private static synchronized void closeHeartbeat() {
+        try { if (hbProducer != null) hbProducer.close(); } catch (Exception ignored) {}
+        try { if (hbSession  != null) hbSession.close();  } catch (Exception ignored) {}
+        try { if (hbConn     != null) hbConn.close();     } catch (Exception ignored) {}
+        hbProducer = null;
+        hbSession  = null;
+        hbConn     = null;
+    }
+
+    private static void stopHeartbeat() {
+        if (heartbeatExec != null) heartbeatExec.shutdownNow();
+        closeHeartbeat();
+    }
+
+    // --- Data loading (unchanged from Stage 2) --------------------------
 
     private static synchronized boolean loadFromIngestion() {
         try {
@@ -158,6 +272,10 @@ public class IntersectionServiceApp {
             System.err.println("[intersection] load failed: " + e.getMessage());
             return false;
         }
+    }
+
+    private static void unavailable(io.javalin.http.Context ctx) {
+        ctx.status(503).json(Map.of("error", "intersection data not loaded"));
     }
 
     private static String titleCase(String input) {
