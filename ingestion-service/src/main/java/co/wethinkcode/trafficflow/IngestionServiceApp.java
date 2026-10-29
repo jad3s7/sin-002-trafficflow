@@ -8,12 +8,18 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class IngestionServiceApp {
 
     // Class-level variable to store the cleaned, deduplicated intersection data
     // so it can be served by the REST endpoint.
     private static List<Intersection> finalCleanedData = new ArrayList<>();
+
+    // Recognised active_flag representations. Immutable so they are safe to
+    // share and trivially unit-testable.
+    private static final Set<String> TRUE_VALUES  = Set.of("y", "yes", "1", "true",  "t");
+    private static final Set<String> FALSE_VALUES = Set.of("n", "no",  "0", "false", "f");
 
     // Simple data class to hold a cleaned intersection record.
     static class Intersection {
@@ -79,18 +85,15 @@ public class IngestionServiceApp {
                 String trimmedSignalType = normalizeWhitespace(rawSignalType);
                 String trimmedActiveFlag = normalizeWhitespace(rawActiveFlag);
 
-                // Step 1 + Step 4: casing normalization, where missing and
-                // placeholder values are mapped to null (not guessed).
-                //   id         -> UPPERCASE  (null if missing/placeholder)
-                //   district   -> Title Case (null if missing/placeholder)
-                //   signalType -> lowercase  (null if missing/placeholder)
-                //   active     -> Boolean    (null if missing/placeholder)
+                // Step 1 + 4: casing normalization; missing/placeholder -> null.
                 String normalizedId         = normalizeId(trimmedId);
                 String normalizedDistrict   = normalizeDistrict(trimmedDistrict);
                 String normalizedSignalType = normalizeSignalType(trimmedSignalType);
+
+                // Step 5: normalize active_flag boolean representations.
                 Boolean normalizedActive    = normalizeBoolean(trimmedActiveFlag);
 
-                // Step 4: the constructor computes missingFields automatically.
+                // Step 4: constructor computes missingFields automatically.
                 Intersection record = new Intersection(
                         normalizedId,
                         normalizedDistrict,
@@ -127,26 +130,12 @@ public class IngestionServiceApp {
 
     // --- Step 3: duplicate detection & collapse ---------------------------
 
-    /**
-     * Collapse records that represent the same real-world intersection.
-     *
-     * Pass 1 — same normalized id. Strongest signal; id is the primary key.
-     * Pass 2 — same (district, signalType) across different ids. Softer signal
-     *          that catches id typos; every collapse is logged so it is
-     *          observable and reversible if the heuristic misfires for a
-     *          particular dataset.
-     *
-     * Order is preserved (LinkedHashMap) so the output is deterministic:
-     * the earliest surviving record keeps its position.
-     */
     private static List<Intersection> deduplicate(List<Intersection> records) {
         // Pass 1: collapse on normalized id.
         Map<String, Intersection> byId = new LinkedHashMap<>();
         int anonIdCounter = 0;
         for (Intersection r : records) {
             if (r.id == null || r.id.isEmpty()) {
-                // No id — nothing to key on; give it a unique bucket so
-                // multiple id-less records don't accidentally collapse.
                 byId.put("__anon__" + (anonIdCounter++), r);
                 continue;
             }
@@ -165,9 +154,6 @@ public class IngestionServiceApp {
         for (Intersection r : byId.values()) {
             String fp = fingerprint(r);
             if (fp == null) {
-                // No usable fingerprint (district or signalType missing) —
-                // we can't confidently say it's a duplicate, so keep it
-                // under a unique key (id if present, else a counter).
                 String key = (r.id != null)
                         ? ("__id__:" + r.id)
                         : ("__anonfp__" + (anonFpCounter++));
@@ -188,25 +174,11 @@ public class IngestionServiceApp {
         return new ArrayList<>(byFingerprint.values());
     }
 
-    /**
-     * Fingerprint used for the softer "same real-world intersection" check.
-     * Deliberately ignores `active` (the field most likely to be stale between
-     * duplicate rows) and returns null when we can't say anything useful.
-     */
     private static String fingerprint(Intersection r) {
         if (r.district == null || r.signalType == null) return null;
         return r.district + "|" + r.signalType;
     }
 
-    /**
-     * Combine two records classified as duplicates:
-     *   - keep the earlier record's non-null values
-     *   - fill any nulls from the later record
-     *   - log any non-null conflict so it's visible in the ingestion output
-     *
-     * "First occurrence wins" on genuine conflicts keeps the behaviour
-     * deterministic and matches the CSV row order.
-     */
     private static Intersection merge(Intersection earlier, Intersection later) {
         String id = earlier.id != null ? earlier.id : later.id;
 
@@ -234,46 +206,51 @@ public class IngestionServiceApp {
                     + " — keeping " + earlier.active);
         }
 
-        // Constructor recomputes missingFields from the merged values, so
-        // filling a null from the later record correctly removes it from
-        // the missingFields list.
         return new Intersection(id, district, signalType, active);
     }
 
     // --- Casing normalization helpers ------------------------------------
 
-    /**
-     * IDs -> UPPERCASE. Missing / placeholder id becomes null so the
-     * record is explicitly marked as having no id rather than silently
-     * getting an empty string.
-     */
     private static String normalizeId(String raw) {
         if (isMissingOrPlaceholder(raw)) return null;
         return raw.toUpperCase();
     }
 
-    /** Districts -> per-word Title Case, e.g. "DOWNTOWN plaza" -> "Downtown Plaza". */
     private static String normalizeDistrict(String raw) {
         if (isMissingOrPlaceholder(raw)) return null;
         return toTitleCase(raw);
     }
 
-    /** Signal types -> lowercase, so "4-WAY" and "4-way" collapse to one form. */
     private static String normalizeSignalType(String raw) {
         if (isMissingOrPlaceholder(raw)) return null;
         return raw.toLowerCase();
     }
 
-    // --- Whitespace normalization ----------------------------------------
+    // --- Step 5: boolean normalization -----------------------------------
 
     /**
-     * Normalize a raw CSV cell's whitespace:
-     *   - strip leading and trailing whitespace
-     *   - collapse runs of internal whitespace to a single space
+     * Collapse the various active_flag representations to a Boolean.
      *
-     * Unicode-aware via String#strip() + \p{javaWhitespace}+ so it also covers
-     * tabs, newlines, and non-ASCII spaces — not just the ASCII space character.
+     *   true  : "y", "yes", "1", "true",  "t"
+     *   false : "n", "no",  "0", "false", "f"
+     *   null  : missing / placeholder, or an unrecognised value (which is
+     *           logged so it is not silently guessed at).
+     *
+     * Input is expected already trimmed / casing is folded here so the
+     * sets themselves can stay lowercase for readability.
      */
+    private static Boolean normalizeBoolean(String flag) {
+        if (isMissingOrPlaceholder(flag)) return null;
+        String normalized = flag.toLowerCase();
+        if (TRUE_VALUES.contains(normalized))  return true;
+        if (FALSE_VALUES.contains(normalized)) return false;
+        System.out.println("[ingestion] unrecognised active_flag value '"
+                + flag + "' — treating as unknown");
+        return null;
+    }
+
+    // --- Whitespace normalization ----------------------------------------
+
     private static String normalizeWhitespace(String input) {
         if (input == null) return null;
         return input.strip().replaceAll("\\p{javaWhitespace}+", " ");
@@ -281,11 +258,6 @@ public class IngestionServiceApp {
 
     // --- Generic helpers -------------------------------------------------
 
-    /**
-     * Explicit list of "we have no real value for this cell" indicators.
-     * Anything matching one of these is treated as missing and is NOT
-     * guessed at — the field is set to null and recorded in missingFields.
-     */
     private static boolean isMissingOrPlaceholder(String value) {
         if (value == null || value.isEmpty()) return true;
         String normalized = value.toLowerCase();
@@ -300,11 +272,6 @@ public class IngestionServiceApp {
                 || normalized.equals("undefined");
     }
 
-    /**
-     * Title-case each whitespace-separated word:
-     *   "DOWNTOWN"        -> "Downtown"
-     *   "DOWNTOWN plaza"  -> "Downtown Plaza"
-     */
     private static String toTitleCase(String input) {
         if (input == null || input.isEmpty()) return null;
         String[] words = input.toLowerCase().split("\\s+");
@@ -316,19 +283,5 @@ public class IngestionServiceApp {
             sb.append(word.substring(1));
         }
         return sb.toString();
-    }
-
-    private static Boolean normalizeBoolean(String flag) {
-        if (isMissingOrPlaceholder(flag)) return null;
-        String normalized = flag.toLowerCase();
-        if (normalized.equals("y") || normalized.equals("yes")
-                || normalized.equals("1") || normalized.equals("true")) {
-            return true;
-        }
-        if (normalized.equals("n") || normalized.equals("no")
-                || normalized.equals("0") || normalized.equals("false")) {
-            return false;
-        }
-        return null;
     }
 }
