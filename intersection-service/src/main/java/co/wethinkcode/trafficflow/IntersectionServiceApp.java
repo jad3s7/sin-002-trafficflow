@@ -20,6 +20,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -103,7 +104,7 @@ public class IntersectionServiceApp {
 
         app.get("/intersections/{id}", ctx -> {
             if (!loaded) { unavailable(ctx); return; }
-            String id = ctx.pathParam("id").toUpperCase();
+            String id = normalizeIntersectionId(ctx.pathParam("id"));
             Intersection r = byId.get(id);
             if (r == null) {
                 ctx.status(404).json(Map.of("error", "intersection not found: " + id));
@@ -280,7 +281,7 @@ public class IntersectionServiceApp {
 
     private static String titleCase(String input) {
         if (input == null || input.isEmpty()) return null;
-        String[] words = input.toLowerCase().split("\\s+");
+        String[] words = input.toLowerCase(Locale.ROOT).split("\\s+");
         StringBuilder sb = new StringBuilder();
         for (String word : words) {
             if (word.isEmpty()) continue;
@@ -289,5 +290,11 @@ public class IntersectionServiceApp {
             sb.append(word.substring(1));
         }
         return sb.toString();
+    }
+
+    private static String normalizeIntersectionId(String input) {
+        if (input == null) return null;
+        String normalized = input.strip().toUpperCase(Locale.ROOT);
+        return normalized.replaceFirst("^([A-Z]+)[\\s_-]*(\\d+)$", "$1-$2");
     }
 }

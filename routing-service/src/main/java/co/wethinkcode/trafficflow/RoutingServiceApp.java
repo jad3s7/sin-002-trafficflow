@@ -21,12 +21,17 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 public class RoutingServiceApp {
 
     private static final int    PORT              = 7023;
     private static final String INTERSECTION_BASE = "http://localhost:7021";
+    private static final String CONGESTION_BASE   = "http://localhost:7022";
+    private static final String CONGESTION_SOURCE = System.getenv()
+            .getOrDefault("TRAFFICFLOW_CONGESTION_SOURCE", "mq")
+            .trim().toLowerCase(Locale.ROOT);
 
     private static final double BASE_MINUTES = 5.0;
 
@@ -51,9 +56,17 @@ public class RoutingServiceApp {
     private static volatile MessageConsumer mqConsumer;
 
     public static void main(String[] args) {
-        startSubscriber();
-        Runtime.getRuntime().addShutdownHook(new Thread(
-                RoutingServiceApp::stopSubscriber, "mq-shutdown"));
+        if (!CONGESTION_SOURCE.equals("mq") && !CONGESTION_SOURCE.equals("http")) {
+            throw new IllegalArgumentException(
+                    "TRAFFICFLOW_CONGESTION_SOURCE must be 'mq' or 'http'");
+        }
+        if (CONGESTION_SOURCE.equals("mq")) {
+            startSubscriber();
+            Runtime.getRuntime().addShutdownHook(new Thread(
+                    RoutingServiceApp::stopSubscriber, "mq-shutdown"));
+        } else {
+            System.out.println("[routing] using per-request HTTP congestion lookup");
+        }
 
         Javalin app = Javalin.create().start(PORT);
 
@@ -81,8 +94,8 @@ public class RoutingServiceApp {
                         "error", "query params 'from' and 'to' required"));
                 return;
             }
-            String from = rawFrom.trim().toUpperCase();
-            String to   = rawTo.trim().toUpperCase();
+            String from = normalizeIntersectionId(rawFrom);
+            String to   = normalizeIntersectionId(rawTo);
             if (from.equals(to)) {
                 ctx.status(400).json(Map.of(
                         "error", "'from' and 'to' must differ"));
@@ -121,10 +134,25 @@ public class RoutingServiceApp {
                 return;
             }
 
-            // Congestion now comes from the subscriber cache, not an HTTP GET.
-            int    levelSnapshot = level;
-            long   lastUpdated   = levelLastUpdatedAt;
-            boolean stale        = (lastUpdated == 0L);
+            int levelSnapshot;
+            long lastUpdated = 0L;
+            boolean stale = false;
+            if (CONGESTION_SOURCE.equals("http")) {
+                try {
+                    levelSnapshot = fetchCongestionLevel();
+                } catch (DependencyException e) {
+                    ctx.status(502).json(Map.of(
+                            "error", "congestion-service unavailable",
+                            "detail", e.getMessage()));
+                    return;
+                }
+            } else {
+                // Stage 3 replaces Stage 2's per-request HTTP call with the
+                // latest value received from the ActiveMQ topic.
+                levelSnapshot = level;
+                lastUpdated = levelLastUpdatedAt;
+                stale = (lastUpdated == 0L);
+            }
 
             double multiplier = 1.0 + levelSnapshot * 0.25;
             double fromDelay  = signalDelay(fromIx.signalType);
@@ -144,8 +172,9 @@ public class RoutingServiceApp {
             Map<String, Object> breakdown = new HashMap<>();
             breakdown.put("baseMinutes",            BASE_MINUTES);
             breakdown.put("congestionLevel",        levelSnapshot);
-            breakdown.put("congestionStale",        stale);
-            if (!stale) {
+            breakdown.put("congestionSource",       CONGESTION_SOURCE);
+            if (CONGESTION_SOURCE.equals("mq")) breakdown.put("congestionStale", stale);
+            if (CONGESTION_SOURCE.equals("mq") && !stale) {
                 breakdown.put("congestionUpdatedAtMsAgo",
                         System.currentTimeMillis() - lastUpdated);
             }
@@ -244,6 +273,30 @@ public class RoutingServiceApp {
         }
     }
 
+    private static int fetchCongestionLevel() throws DependencyException {
+        HttpResponse<String> resp = get(CONGESTION_BASE + "/congestion",
+                "congestion-service");
+        if (resp.statusCode() != 200) {
+            throw new DependencyException("HTTP " + resp.statusCode());
+        }
+        try {
+            JsonNode root = MAPPER.readTree(resp.body());
+            JsonNode congestionLevel = root.get("level");
+            if (congestionLevel == null || !congestionLevel.isInt()) {
+                throw new DependencyException("response missing integer 'level'");
+            }
+            int value = congestionLevel.asInt();
+            if (value < 0 || value > 8) {
+                throw new DependencyException("response level outside range 0-8");
+            }
+            return value;
+        } catch (DependencyException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new DependencyException("bad JSON: " + e.getMessage());
+        }
+    }
+
     private static HttpResponse<String> get(String url, String name)
             throws DependencyException {
         HttpRequest req;
@@ -268,8 +321,13 @@ public class RoutingServiceApp {
 
     private static double signalDelay(String signalType) {
         if (signalType == null) return DEFAULT_SIGNAL_DELAY;
-        Double d = SIGNAL_DELAY.get(signalType.toLowerCase());
+        Double d = SIGNAL_DELAY.get(signalType.toLowerCase(Locale.ROOT));
         return d != null ? d : DEFAULT_SIGNAL_DELAY;
+    }
+
+    private static String normalizeIntersectionId(String input) {
+        String normalized = input.strip().toUpperCase(Locale.ROOT);
+        return normalized.replaceFirst("^([A-Z]+)[\\s_-]*(\\d+)$", "$1-$2");
     }
 
     // --- DTOs & exceptions -----------------------------------------------

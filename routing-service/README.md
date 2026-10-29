@@ -7,7 +7,15 @@ Provides estimated travel times based on congestion and intersection.
 Part of the [TrafficFlow](../README.md) project. Independent Maven module, no
 parent pom.
 
-MQ: this service subscribes to the ActiveMQ topic `congestion-topic` — see [`../common/`](../common). Broker URL and topic name come from the common `co.wethinkcode.trafficflow.mq.MqConfig` class alongside it in this module.
+By default, this service subscribes to the ActiveMQ topic `congestion-topic` —
+see [`../common/`](../common). Broker URL and topic name come from this module's
+`co.wethinkcode.trafficflow.MqConfig`.
+
+To run the required Stage 2 synchronous REST integration by itself, set
+`TRAFFICFLOW_CONGESTION_SOURCE=http` when starting this service. In that mode,
+each route request reads the current congestion from
+`http://localhost:7022/congestion`. The default `mq` mode uses the Stage 3 topic
+subscriber instead.
 
 ## Project structure
 
@@ -30,6 +38,12 @@ mvn package
 
 ```
 java -jar target/routing-service.jar
+```
+
+For Stage 2 HTTP mode:
+
+```
+TRAFFICFLOW_CONGESTION_SOURCE=http java -jar target/routing-service.jar
 ```
 
 Listens on port `7023`.
