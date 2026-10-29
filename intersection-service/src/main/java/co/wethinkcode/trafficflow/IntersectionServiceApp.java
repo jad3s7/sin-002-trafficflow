@@ -2,7 +2,6 @@ package co.wethinkcode.trafficflow;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
-
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -21,30 +20,23 @@ public class IntersectionServiceApp {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final HttpClient   HTTP   = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(2))
-            .build();
+            .connectTimeout(Duration.ofSeconds(2)).build();
 
-    // Canonical list + lookup indexes, refreshed from ingestion.
-    // volatile references, only ever reassigned (never mutated in place),
-    // so request threads see a consistent snapshot without locking.
-    private static volatile List<Intersection>            intersections = new ArrayList<>();
-    private static volatile Map<String, Intersection>     byId          = new HashMap<>();
-    private static volatile Map<String, List<Intersection>> byDistrict  = new HashMap<>();
-    private static volatile boolean                       loaded        = false;
+    private static volatile List<Intersection>              intersections = new ArrayList<>();
+    private static volatile Map<String, Intersection>       byId          = new HashMap<>();
+    private static volatile Map<String, List<Intersection>> byDistrict    = new HashMap<>();
+    private static volatile boolean                         loaded        = false;
 
-    // Wire DTO — matches ingestion-service's JSON shape.
     public static class Intersection {
         public String       id;
         public String       district;
         public String       signalType;
         public Boolean      active;
         public List<String> missingFields;
-
         public Intersection() {}
     }
 
     public static void main(String[] args) {
-        // Bounded startup retry so start order doesn't matter in a demo.
         boolean ok = false;
         for (int attempt = 0; attempt < 3 && !ok; attempt++) {
             if (attempt > 0) {
@@ -59,19 +51,29 @@ public class IntersectionServiceApp {
 
         Javalin app = Javalin.create().start(PORT);
 
+        // Catch-all error envelope.
+        app.exception(Exception.class, (e, ctx) -> {
+            System.err.println("[intersection] unhandled exception: " + e);
+            e.printStackTrace();
+            ctx.status(500).json(Map.of("error", "internal server error"));
+        });
+        app.error(404, ctx -> ctx.status(404).json(
+                Map.of("error", "not found", "path", ctx.path())));
+        app.error(405, ctx -> ctx.status(405).json(
+                Map.of("error", "method not allowed",
+                        "method", ctx.req().getMethod(),
+                        "path",   ctx.path())));
+
         app.get("/health", ctx -> {
             if (loaded) ctx.result("OK");
             else        ctx.status(503).result("INTERSECTION DATA NOT LOADED");
         });
 
-        // Full list — debug / bulk consumer.
         app.get("/intersections", ctx -> {
             if (!loaded) { unavailable(ctx); return; }
             ctx.json(intersections);
         });
 
-        // Primary lookup — routing-service uses this to validate endpoints.
-        //   200 -> record  |  404 -> unknown id  |  503 -> data not loaded
         app.get("/intersections/{id}", ctx -> {
             if (!loaded) { unavailable(ctx); return; }
             String id = ctx.pathParam("id").toUpperCase();
@@ -83,15 +85,11 @@ public class IntersectionServiceApp {
             ctx.json(r);
         });
 
-        // Distinct district names.
         app.get("/districts", ctx -> {
             if (!loaded) { unavailable(ctx); return; }
             ctx.json(new ArrayList<>(byDistrict.keySet()));
         });
 
-        // District lookup — case-insensitive.
-        //   200 -> {"district":"Downtown","count":3,"intersectionIds":[...]}
-        //   404 -> unknown district
         app.get("/districts/{name}", ctx -> {
             if (!loaded) { unavailable(ctx); return; }
             String requested = ctx.pathParam("name");
@@ -109,8 +107,6 @@ public class IntersectionServiceApp {
             ctx.json(resp);
         });
 
-        // Manual reload — recovers from bad start order, or after ingestion
-        // data changes.
         app.post("/refresh", ctx -> {
             if (loadFromIngestion()) {
                 ctx.json(Map.of("refreshed", true, "count", intersections.size()));
@@ -126,28 +122,20 @@ public class IntersectionServiceApp {
         ctx.status(503).json(Map.of("error", "intersection data not loaded"));
     }
 
-    /**
-     * Pull the cleaned list from ingestion-service and rebuild indexes.
-     * Synchronized so concurrent /refresh calls can't corrupt state.
-     */
     private static synchronized boolean loadFromIngestion() {
         try {
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(INGESTION_URL))
                     .timeout(Duration.ofSeconds(5))
-                    .GET()
-                    .build();
+                    .GET().build();
             HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() != 200) {
                 System.err.println("[intersection] ingestion returned HTTP "
                         + resp.statusCode());
                 return false;
             }
-
-            List<Intersection> list = MAPPER.readValue(
-                    resp.body(),
-                    MAPPER.getTypeFactory()
-                            .constructCollectionType(List.class, Intersection.class));
+            List<Intersection> list = MAPPER.readValue(resp.body(),
+                    MAPPER.getTypeFactory().constructCollectionType(List.class, Intersection.class));
 
             Map<String, Intersection>       idx         = new HashMap<>();
             Map<String, List<Intersection>> districtIdx = new HashMap<>();
@@ -162,7 +150,6 @@ public class IntersectionServiceApp {
             byId          = idx;
             byDistrict    = districtIdx;
             loaded        = true;
-
             System.out.println("[intersection] loaded " + list.size()
                     + " intersections (" + idx.size() + " with ids, "
                     + districtIdx.size() + " districts)");
@@ -173,7 +160,6 @@ public class IntersectionServiceApp {
         }
     }
 
-    /** Same Title Case used by ingestion-service — keeps district lookups consistent. */
     private static String titleCase(String input) {
         if (input == null || input.isEmpty()) return null;
         String[] words = input.toLowerCase().split("\\s+");
