@@ -30,8 +30,9 @@ cleanup through synchronous REST calls to asynchronous MQ decoupling and alertin
 Plus [`common/`](common) (no port) — the shared ActiveMQ broker and MQ config notes
 for `congestion-topic`: Routing Service becomes aware of congestion changes via an ActiveMQ Topic instead of querying Congestion Service directly.
 
-**Status:** scaffold only — build files, Javalin bootstrap, and TODOs are in place; no
-business logic has been implemented yet.
+**Status:** Stage 1 ingestion, Stage 2 domain endpoints and routing, Stage 3
+congestion messaging, and Stage 4 watchdog alerting are implemented. The
+ingestion service normalizes records and deduplicates by canonicalized ID.
 
 ## Your task
 

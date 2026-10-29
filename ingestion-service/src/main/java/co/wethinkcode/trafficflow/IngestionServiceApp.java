@@ -7,6 +7,7 @@ import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -138,51 +139,27 @@ public class IngestionServiceApp {
     }
 
     // --- Dedup + casing + whitespace + boolean + placeholder helpers ---
-    // (unchanged from previous sub-step — see earlier commit)
 
     private static List<Intersection> deduplicate(List<Intersection> records) {
-        Map<String, Intersection> byId = new LinkedHashMap<>();
-        int anonIdCounter = 0;
+        List<Intersection> result = new ArrayList<>();
+        Map<String, Integer> indexById = new LinkedHashMap<>();
         for (Intersection r : records) {
             if (r.id == null || r.id.isEmpty()) {
-                byId.put("__anon__" + (anonIdCounter++), r);
+                // Without an ID there is no reliable identity key. Keep the
+                // record visible instead of guessing from district/signal type.
+                result.add(r);
                 continue;
             }
-            Intersection existing = byId.get(r.id);
-            if (existing == null) byId.put(r.id, r);
-            else {
+            Integer existingIndex = indexById.get(r.id);
+            if (existingIndex == null) {
+                indexById.put(r.id, result.size());
+                result.add(r);
+            } else {
                 System.out.println("[ingestion] duplicate id '" + r.id + "' — merging");
-                byId.put(r.id, merge(existing, r));
+                result.set(existingIndex, merge(result.get(existingIndex), r));
             }
         }
-
-        Map<String, Intersection> byFingerprint = new LinkedHashMap<>();
-        int anonFpCounter = 0;
-        for (Intersection r : byId.values()) {
-            String fp = fingerprint(r);
-            if (fp == null) {
-                String key = (r.id != null)
-                        ? ("__id__:" + r.id)
-                        : ("__anonfp__" + (anonFpCounter++));
-                byFingerprint.put(key, r);
-                continue;
-            }
-            Intersection existing = byFingerprint.get(fp);
-            if (existing == null) byFingerprint.put(fp, r);
-            else {
-                System.out.println("[ingestion] suspected duplicate (fingerprint '"
-                        + fp + "'): keeping id " + existing.id
-                        + ", merging in id " + r.id);
-                byFingerprint.put(fp, merge(existing, r));
-            }
-        }
-
-        return new ArrayList<>(byFingerprint.values());
-    }
-
-    private static String fingerprint(Intersection r) {
-        if (r.district == null || r.signalType == null) return null;
-        return r.district + "|" + r.signalType;
+        return result;
     }
 
     private static Intersection merge(Intersection earlier, Intersection later) {
@@ -217,7 +194,10 @@ public class IngestionServiceApp {
 
     private static String normalizeId(String raw) {
         if (isMissingOrPlaceholder(raw)) return null;
-        return raw.toUpperCase();
+        String normalized = raw.toUpperCase(Locale.ROOT);
+        // IDs commonly arrive with the prefix/number separator omitted or
+        // changed (for example INT1005, int_1005, and INT-1005).
+        return normalized.replaceFirst("^([A-Z]+)[\\s_-]*(\\d+)$", "$1-$2");
     }
 
     private static String normalizeDistrict(String raw) {
@@ -227,12 +207,12 @@ public class IngestionServiceApp {
 
     private static String normalizeSignalType(String raw) {
         if (isMissingOrPlaceholder(raw)) return null;
-        return raw.toLowerCase();
+        return raw.toLowerCase(Locale.ROOT);
     }
 
     private static Boolean normalizeBoolean(String flag) {
         if (isMissingOrPlaceholder(flag)) return null;
-        String normalized = flag.toLowerCase();
+        String normalized = flag.toLowerCase(Locale.ROOT);
         if (TRUE_VALUES.contains(normalized))  return true;
         if (FALSE_VALUES.contains(normalized)) return false;
         System.out.println("[ingestion] unrecognised active_flag value '"
@@ -247,7 +227,7 @@ public class IngestionServiceApp {
 
     private static boolean isMissingOrPlaceholder(String value) {
         if (value == null || value.isEmpty()) return true;
-        String normalized = value.toLowerCase();
+        String normalized = value.toLowerCase(Locale.ROOT);
         return normalized.equals("unknown") || normalized.equals("n/a")
                 || normalized.equals("tbd")     || normalized.equals("-")
                 || normalized.equals("nan")     || normalized.equals("null")
@@ -257,7 +237,7 @@ public class IngestionServiceApp {
 
     private static String toTitleCase(String input) {
         if (input == null || input.isEmpty()) return null;
-        String[] words = input.toLowerCase().split("\\s+");
+        String[] words = input.toLowerCase(Locale.ROOT).split("\\s+");
         StringBuilder sb = new StringBuilder(input.length());
         for (String word : words) {
             if (word.isEmpty()) continue;

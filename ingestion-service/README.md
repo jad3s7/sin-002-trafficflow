@@ -66,6 +66,13 @@ What happened:
   than dropped or guessed, so downstream services can see it's missing.
 - `INT-1015`: same idea for a missing district.
 
+Duplicate matching uses the normalized intersection ID. IDs are uppercased and
+common prefix/number separator variants are canonicalized (for example,
+`INT1005`, `int_1005`, and `INT-1005` become `INT-1005`). Duplicate rows merge
+missing values from later rows into the first row; conflicting populated values
+keep the first value and are logged. Rows with no usable ID are kept separately,
+because district and signal type alone do not uniquely identify an intersection.
+
 ## Project structure
 
 ```
@@ -88,15 +95,16 @@ mvn package
 java -jar target/ingestion-service.jar
 ```
 
-Listens on port `7020`. Currently just exposes `/health` — the actual CSV
-parsing/cleaning logic is a TODO.
+Listens on port `7020`. `GET /health` reports whether the CSV loaded, and
+`GET /intersections` returns the cleaned and deduplicated records as JSON.
 
 ## Test
 
-No automated tests yet. Manually verify it's up:
+No automated tests are currently included. Manually verify the service and data:
 
 ```
 curl http://localhost:7020/health   # -> OK
+curl http://localhost:7020/intersections
 ```
 
 To add real tests, add JUnit 5 + the Surefire plugin to `pom.xml`, put tests under
