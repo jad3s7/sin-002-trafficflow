@@ -5,9 +5,9 @@ import java.io.InputStream;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.HashMap;
 
 public class IngestionServiceApp {
 
@@ -83,12 +83,9 @@ public class IngestionServiceApp {
                 ));
             }
 
-            // Deduplicate by (already-normalized) id — first occurrence wins.
-            Map<String, Intersection> deduplicated = new HashMap<>();
-            for (Intersection record : cleanedRecords) {
-                deduplicated.putIfAbsent(record.id, record);
-            }
-            finalCleanedData = new ArrayList<>(deduplicated.values());
+            // Step 3: detect and collapse duplicate records for the same
+            // real-world intersection. See `deduplicate` for the strategy.
+            finalCleanedData = deduplicate(cleanedRecords);
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -96,6 +93,112 @@ public class IngestionServiceApp {
 
         // Expose cleaned data for other services to consume.
         app.get("/intersections", ctx -> ctx.json(finalCleanedData));
+    }
+
+    // --- Step 3: duplicate detection & collapse ---------------------------
+
+    /**
+     * Collapse records that represent the same real-world intersection.
+     *
+     * Pass 1 — same normalized id. Strongest signal; id is the primary key.
+     * Pass 2 — same (district, signalType) across different ids. Softer signal
+     *          that catches id typos; every collapse is logged so it is
+     *          observable and reversible if the heuristic misfires for a
+     *          particular dataset.
+     *
+     * Order is preserved (LinkedHashMap) so the output is deterministic:
+     * the earliest surviving record keeps its position.
+     */
+    private static List<Intersection> deduplicate(List<Intersection> records) {
+        // Pass 1: collapse on normalized id.
+        Map<String, Intersection> byId = new LinkedHashMap<>();
+        for (Intersection r : records) {
+            if (r.id == null || r.id.isEmpty()) {
+                // No id — nothing to key on; let it through to the
+                // fingerprint pass below (which will also skip it).
+                byId.put("__anon__" + byId.size(), r);
+                continue;
+            }
+            Intersection existing = byId.get(r.id);
+            if (existing == null) {
+                byId.put(r.id, r);
+            } else {
+                System.out.println("[ingestion] duplicate id '" + r.id + "' — merging");
+                byId.put(r.id, merge(existing, r));
+            }
+        }
+
+        // Pass 2: collapse on (district, signalType) across differing ids.
+        Map<String, Intersection> byFingerprint = new LinkedHashMap<>();
+        for (Intersection r : byId.values()) {
+            String fp = fingerprint(r);
+            if (fp == null) {
+                // No usable fingerprint (district or signalType missing) —
+                // we can't confidently say it's a duplicate, so keep it.
+                byFingerprint.put("__id__:" + r.id, r);
+                continue;
+            }
+            Intersection existing = byFingerprint.get(fp);
+            if (existing == null) {
+                byFingerprint.put(fp, r);
+            } else {
+                System.out.println("[ingestion] suspected duplicate (fingerprint '"
+                        + fp + "'): keeping id " + existing.id
+                        + ", merging in id " + r.id);
+                byFingerprint.put(fp, merge(existing, r));
+            }
+        }
+
+        return new ArrayList<>(byFingerprint.values());
+    }
+
+    /**
+     * Fingerprint used for the softer "same real-world intersection" check.
+     * Deliberately ignores `active` (the field most likely to be stale between
+     * duplicate rows) and returns null when we can't say anything useful.
+     */
+    private static String fingerprint(Intersection r) {
+        if (r.district == null || r.signalType == null) return null;
+        return r.district + "|" + r.signalType;
+    }
+
+    /**
+     * Combine two records that have been classified as duplicates:
+     *   - keep the earlier record's non-null values
+     *   - fill any nulls from the later record
+     *   - log any non-null conflict so it's visible in the ingestion output
+     *
+     * "First occurrence wins" on genuine conflicts keeps the behaviour
+     * deterministic and matches the CSV row order.
+     */
+    private static Intersection merge(Intersection earlier, Intersection later) {
+        String id = earlier.id != null ? earlier.id : later.id;
+
+        String district = earlier.district != null ? earlier.district : later.district;
+        if (earlier.district != null && later.district != null
+                && !earlier.district.equals(later.district)) {
+            System.out.println("[ingestion] district conflict on " + id
+                    + ": '" + earlier.district + "' vs '" + later.district
+                    + "' — keeping '" + earlier.district + "'");
+        }
+
+        String signalType = earlier.signalType != null ? earlier.signalType : later.signalType;
+        if (earlier.signalType != null && later.signalType != null
+                && !earlier.signalType.equals(later.signalType)) {
+            System.out.println("[ingestion] signalType conflict on " + id
+                    + ": '" + earlier.signalType + "' vs '" + later.signalType
+                    + "' — keeping '" + earlier.signalType + "'");
+        }
+
+        Boolean active = earlier.active != null ? earlier.active : later.active;
+        if (earlier.active != null && later.active != null
+                && !earlier.active.equals(later.active)) {
+            System.out.println("[ingestion] active conflict on " + id
+                    + ": " + earlier.active + " vs " + later.active
+                    + " — keeping " + earlier.active);
+        }
+
+        return new Intersection(id, district, signalType, active);
     }
 
     // --- Casing normalization helpers ------------------------------------
