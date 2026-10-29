@@ -12,30 +12,19 @@ import java.util.Set;
 
 public class IngestionServiceApp {
 
-    // Populated once at startup, before Javalin starts serving. Read-only
-    // afterwards, so no synchronization is needed (Javalin's worker threads
-    // are created inside start(), which happens-after the assignment).
     private static List<Intersection> finalCleanedData = new ArrayList<>();
 
-    // Recognised active_flag representations. Immutable so they are safe to
-    // share and trivially unit-testable.
     private static final Set<String> TRUE_VALUES  = Set.of("y", "yes", "1", "true",  "t");
     private static final Set<String> FALSE_VALUES = Set.of("n", "no",  "0", "false", "f");
 
-    // Simple data class to hold a cleaned intersection record.
     static class Intersection {
         String id;
         String district;
         String signalType;
         Boolean active;
-
-        // Names of the fields that were missing or placeholder in the source row.
-        // Empty list == complete record.
         List<String> missingFields;
 
-        Intersection() {
-            this.missingFields = new ArrayList<>();
-        }
+        Intersection() { this.missingFields = new ArrayList<>(); }
 
         Intersection(String id, String district, String signalType, Boolean active) {
             this.id = id;
@@ -43,10 +32,10 @@ public class IngestionServiceApp {
             this.signalType = signalType;
             this.active = active;
             this.missingFields = new ArrayList<>();
-            if (id == null || id.isEmpty())          missingFields.add("id");
-            if (district == null)                     missingFields.add("district");
-            if (signalType == null)                   missingFields.add("signalType");
-            if (active == null)                       missingFields.add("active");
+            if (id == null || id.isEmpty())  missingFields.add("id");
+            if (district == null)             missingFields.add("district");
+            if (signalType == null)           missingFields.add("signalType");
+            if (active == null)               missingFields.add("active");
         }
 
         public String getId()                   { return id; }
@@ -57,8 +46,6 @@ public class IngestionServiceApp {
     }
 
     public static void main(String[] args) {
-        // Load first, start second: a client can never observe /intersections
-        // before the cleaned list is ready.
         boolean loaded = false;
         try {
             finalCleanedData = loadIntersections();
@@ -71,18 +58,24 @@ public class IngestionServiceApp {
 
         Javalin app = Javalin.create().start(7020);
 
-        // Health reflects actual readiness, not just "process is alive".
+        // Catch-all error envelope.
+        app.exception(Exception.class, (e, ctx) -> {
+            System.err.println("[ingestion] unhandled exception: " + e);
+            e.printStackTrace();
+            ctx.status(500).json(Map.of("error", "internal server error"));
+        });
+        app.error(404, ctx -> ctx.status(404).json(
+                Map.of("error", "not found", "path", ctx.path())));
+        app.error(405, ctx -> ctx.status(405).json(
+                Map.of("error", "method not allowed",
+                        "method", ctx.req().getMethod(),
+                        "path",   ctx.path())));
+
         app.get("/health", ctx -> {
-            if (dataLoaded) {
-                ctx.result("OK");
-            } else {
-                ctx.status(503).result("INTERSECTION DATA NOT LOADED");
-            }
+            if (dataLoaded) ctx.result("OK");
+            else            ctx.status(503).result("INTERSECTION DATA NOT LOADED");
         });
 
-        // Stage 1 endpoint: cleaned, deduplicated, normalized records.
-        // Bare JSON array — the exact shape intersection-service will
-        // consume as its canonical list in Stage 2.
         app.get("/intersections", ctx -> {
             if (!dataLoaded) {
                 ctx.status(503).json(Map.of("error", "Intersection data not loaded"));
@@ -92,14 +85,6 @@ public class IngestionServiceApp {
         });
     }
 
-    // --- Data loading (called once, at startup) ---------------------------
-
-    /**
-     * Read, clean, and deduplicate the legacy CSV. Throws if the resource is
-     * missing or any row fails to parse — we fail loudly rather than serving
-     * a partially-cleaned list that would be indistinguishable from a
-     * correctly-empty one.
-     */
     private static List<Intersection> loadIntersections() throws Exception {
         InputStream csvStream = IngestionServiceApp.class.getClassLoader()
                 .getResourceAsStream("intersections-legacy.csv");
@@ -108,7 +93,6 @@ public class IngestionServiceApp {
         }
 
         BufferedReader reader = new BufferedReader(new InputStreamReader(csvStream));
-        // Consume the header row.
         reader.readLine();
 
         List<Intersection> cleanedRecords = new ArrayList<>();
@@ -121,27 +105,18 @@ public class IngestionServiceApp {
             String rawSignalType = values.length > 2 ? values[2] : "";
             String rawActiveFlag = values.length > 3 ? values[3] : "";
 
-            // Step 2: trim padding / collapse double spaces.
             String trimmedId         = normalizeWhitespace(rawId);
             String trimmedDistrict   = normalizeWhitespace(rawDistrict);
             String trimmedSignalType = normalizeWhitespace(rawSignalType);
             String trimmedActiveFlag = normalizeWhitespace(rawActiveFlag);
 
-            // Step 1 + 4: casing normalization; missing/placeholder -> null.
             String normalizedId         = normalizeId(trimmedId);
             String normalizedDistrict   = normalizeDistrict(trimmedDistrict);
             String normalizedSignalType = normalizeSignalType(trimmedSignalType);
-
-            // Step 5: normalize active_flag boolean representations.
             Boolean normalizedActive    = normalizeBoolean(trimmedActiveFlag);
 
-            // Step 4: constructor computes missingFields automatically.
             Intersection record = new Intersection(
-                    normalizedId,
-                    normalizedDistrict,
-                    normalizedSignalType,
-                    normalizedActive
-            );
+                    normalizedId, normalizedDistrict, normalizedSignalType, normalizedActive);
             if (!record.missingFields.isEmpty()) {
                 System.out.println("[ingestion] incomplete record id="
                         + (record.id == null ? "<none>" : record.id)
@@ -150,7 +125,6 @@ public class IngestionServiceApp {
             cleanedRecords.add(record);
         }
 
-        // Step 3: collapse duplicates.
         List<Intersection> result = deduplicate(cleanedRecords);
 
         long incomplete = result.stream()
@@ -163,10 +137,10 @@ public class IngestionServiceApp {
         return result;
     }
 
-    // --- Step 3: duplicate detection & collapse ---------------------------
+    // --- Dedup + casing + whitespace + boolean + placeholder helpers ---
+    // (unchanged from previous sub-step — see earlier commit)
 
     private static List<Intersection> deduplicate(List<Intersection> records) {
-        // Pass 1: collapse on normalized id.
         Map<String, Intersection> byId = new LinkedHashMap<>();
         int anonIdCounter = 0;
         for (Intersection r : records) {
@@ -175,15 +149,13 @@ public class IngestionServiceApp {
                 continue;
             }
             Intersection existing = byId.get(r.id);
-            if (existing == null) {
-                byId.put(r.id, r);
-            } else {
+            if (existing == null) byId.put(r.id, r);
+            else {
                 System.out.println("[ingestion] duplicate id '" + r.id + "' — merging");
                 byId.put(r.id, merge(existing, r));
             }
         }
 
-        // Pass 2: collapse on (district, signalType) across differing ids.
         Map<String, Intersection> byFingerprint = new LinkedHashMap<>();
         int anonFpCounter = 0;
         for (Intersection r : byId.values()) {
@@ -196,9 +168,8 @@ public class IngestionServiceApp {
                 continue;
             }
             Intersection existing = byFingerprint.get(fp);
-            if (existing == null) {
-                byFingerprint.put(fp, r);
-            } else {
+            if (existing == null) byFingerprint.put(fp, r);
+            else {
                 System.out.println("[ingestion] suspected duplicate (fingerprint '"
                         + fp + "'): keeping id " + existing.id
                         + ", merging in id " + r.id);
@@ -244,8 +215,6 @@ public class IngestionServiceApp {
         return new Intersection(id, district, signalType, active);
     }
 
-    // --- Casing normalization helpers ------------------------------------
-
     private static String normalizeId(String raw) {
         if (isMissingOrPlaceholder(raw)) return null;
         return raw.toUpperCase();
@@ -261,8 +230,6 @@ public class IngestionServiceApp {
         return raw.toLowerCase();
     }
 
-    // --- Step 5: boolean normalization -----------------------------------
-
     private static Boolean normalizeBoolean(String flag) {
         if (isMissingOrPlaceholder(flag)) return null;
         String normalized = flag.toLowerCase();
@@ -273,26 +240,18 @@ public class IngestionServiceApp {
         return null;
     }
 
-    // --- Whitespace normalization ----------------------------------------
-
     private static String normalizeWhitespace(String input) {
         if (input == null) return null;
         return input.strip().replaceAll("\\p{javaWhitespace}+", " ");
     }
 
-    // --- Generic helpers -------------------------------------------------
-
     private static boolean isMissingOrPlaceholder(String value) {
         if (value == null || value.isEmpty()) return true;
         String normalized = value.toLowerCase();
-        return normalized.equals("unknown")
-                || normalized.equals("n/a")
-                || normalized.equals("tbd")
-                || normalized.equals("-")
-                || normalized.equals("nan")
-                || normalized.equals("null")
-                || normalized.equals("nil")
-                || normalized.equals("none")
+        return normalized.equals("unknown") || normalized.equals("n/a")
+                || normalized.equals("tbd")     || normalized.equals("-")
+                || normalized.equals("nan")     || normalized.equals("null")
+                || normalized.equals("nil")     || normalized.equals("none")
                 || normalized.equals("undefined");
     }
 
