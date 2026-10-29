@@ -168,7 +168,7 @@ public class RoutingServiceApp {
     private static void startSubscriber() {
         try {
             ActiveMQConnectionFactory cf = new ActiveMQConnectionFactory(
-                    "failover:(" + MqConfig.BROKER_URL + ")");
+                    MqConfig.brokerUrl());
             Connection conn = cf.createConnection();
             conn.start();
             Session session = conn.createSession(false, Session.AUTO_ACKNOWLEDGE);
