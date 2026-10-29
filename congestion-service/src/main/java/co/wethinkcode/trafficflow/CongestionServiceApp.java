@@ -1,6 +1,17 @@
 package co.wethinkcode.trafficflow;
 
 import io.javalin.Javalin;
+import org.apache.activemq.ActiveMQConnectionFactory;
+
+import javax.jms.Connection;
+import javax.jms.DeliveryMode;
+import javax.jms.JMSException;
+import javax.jms.MessageProducer;
+import javax.jms.Session;
+import javax.jms.TextMessage;
+import javax.jms.Topic;
+
+import java.util.HashMap;
 import java.util.Map;
 
 public class CongestionServiceApp {
@@ -11,10 +22,23 @@ public class CongestionServiceApp {
 
     private static volatile int level = 0;
 
+    // MQ publish state — nullable; lazily (re)created by ensurePublisher().
+    private static volatile Connection      mqConn     = null;
+    private static volatile Session         mqSession  = null;
+    private static volatile MessageProducer mqProducer = null;
+
     public static void main(String[] args) {
+        // Best-effort connect at startup; publishLevel() retries if this
+        // failed and the broker came up later.
+        ensurePublisher();
+
+        // Clean shutdown so the broker sees the disconnect immediately.
+        Runtime.getRuntime().addShutdownHook(new Thread(
+                CongestionServiceApp::closePublisher, "mq-shutdown"));
+
         Javalin app = Javalin.create().start(PORT);
 
-        // Catch-all error envelope.
+        // Error envelope (unchanged from Stage 2).
         app.exception(Exception.class, (e, ctx) -> {
             System.err.println("[congestion] unhandled exception: " + e);
             e.printStackTrace();
@@ -52,12 +76,21 @@ public class CongestionServiceApp {
                         "given", body.level));
                 return;
             }
-            boolean changed = setLevel(body.level);
-            ctx.json(Map.of(
-                    "level",       level,
-                    "changed",     changed,
-                    "description", describe(level)
-            ));
+
+            // Set + publish atomically so concurrent PUTs can't publish
+            // an older value after a newer one.
+            PublishResult result = applyLevel(body.level);
+
+            Map<String, Object> resp = new HashMap<>();
+            resp.put("level",       level);
+            resp.put("changed",     result.changed);
+            resp.put("published",   result.published);
+            resp.put("description", describe(level));
+            if (result.changed && !result.published) {
+                resp.put("warning", "level changed but publish to "
+                        + MqConfig.CONGESTION_TOPIC + " failed — broker down?");
+            }
+            ctx.json(resp);
         });
     }
 
@@ -65,13 +98,74 @@ public class CongestionServiceApp {
         public Integer level;
     }
 
-    private static synchronized boolean setLevel(int newLevel) {
-        if (newLevel == level) return false;
-        int previous = level;
-        level = newLevel;
-        System.out.println("[congestion] level " + previous + " -> " + newLevel
-                + " (" + describe(newLevel) + ")");
-        return true;
+    static class PublishResult {
+        final boolean changed;
+        final boolean published;
+        PublishResult(boolean changed, boolean published) {
+            this.changed = changed;
+            this.published = published;
+        }
+    }
+
+    private static synchronized PublishResult applyLevel(int newLevel) {
+        boolean changed = (newLevel != level);
+        if (changed) {
+            int previous = level;
+            level = newLevel;
+            System.out.println("[congestion] level " + previous + " -> " + newLevel
+                    + " (" + describe(newLevel) + ")");
+        }
+        boolean published = changed && publishLevel(newLevel);
+        return new PublishResult(changed, published);
+    }
+
+    // --- MQ plumbing -----------------------------------------------------
+
+    private static synchronized boolean ensurePublisher() {
+        if (mqProducer != null) return true;
+        try {
+            ActiveMQConnectionFactory cf = new ActiveMQConnectionFactory(MqConfig.BROKER_URL);
+            Connection conn = cf.createConnection();
+            conn.start();
+            Session session = conn.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            Topic topic = session.createTopic(MqConfig.CONGESTION_TOPIC);
+            MessageProducer producer = session.createProducer(topic);
+            producer.setDeliveryMode(DeliveryMode.NON_PERSISTENT);
+            mqConn     = conn;
+            mqSession  = session;
+            mqProducer = producer;
+            System.out.println("[congestion] connected to broker " + MqConfig.BROKER_URL
+                    + " (topic=" + MqConfig.CONGESTION_TOPIC + ")");
+            return true;
+        } catch (Exception e) {
+            System.err.println("[congestion] broker unavailable at " + MqConfig.BROKER_URL
+                    + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean publishLevel(int newLevel) {
+        if (!ensurePublisher()) return false;
+        try {
+            TextMessage msg = mqSession.createTextMessage("{\"level\":" + newLevel + "}");
+            mqProducer.send(msg);
+            System.out.println("[congestion] published {\"level\":" + newLevel
+                    + "} to " + MqConfig.CONGESTION_TOPIC);
+            return true;
+        } catch (JMSException e) {
+            System.err.println("[congestion] publish failed: " + e.getMessage());
+            closePublisher();  // force reconnect on next attempt
+            return false;
+        }
+    }
+
+    private static synchronized void closePublisher() {
+        try { if (mqProducer != null) mqProducer.close(); } catch (Exception ignored) {}
+        try { if (mqSession  != null) mqSession.close();  } catch (Exception ignored) {}
+        try { if (mqConn     != null) mqConn.close();     } catch (Exception ignored) {}
+        mqProducer = null;
+        mqSession  = null;
+        mqConn     = null;
     }
 
     private static String describe(int l) {
