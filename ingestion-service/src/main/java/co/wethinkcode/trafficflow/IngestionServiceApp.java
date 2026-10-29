@@ -59,13 +59,13 @@ public class IngestionServiceApp {
                 String rawSignalType = values.length > 2 ? values[2] : "";
                 String rawActiveFlag = values.length > 3 ? values[3] : "";
 
-                // Trim padding / collapse double spaces first.
-                String trimmedId         = trimAllSpaces(rawId);
-                String trimmedDistrict   = trimAllSpaces(rawDistrict);
-                String trimmedSignalType = trimAllSpaces(rawSignalType);
-                String trimmedActiveFlag = trimAllSpaces(rawActiveFlag);
+                // Step 2: trim padding / collapse double spaces.
+                String trimmedId         = normalizeWhitespace(rawId);
+                String trimmedDistrict   = normalizeWhitespace(rawDistrict);
+                String trimmedSignalType = normalizeWhitespace(rawSignalType);
+                String trimmedActiveFlag = normalizeWhitespace(rawActiveFlag);
 
-                // Casing normalization — collapse each field to one canonical form:
+                // Step 1: casing normalization — collapse each field to one form:
                 //   id         -> UPPERCASE       ("int-1001"       -> "INT-1001")
                 //   district   -> Title Case      ("DOWNTOWN plaza" -> "Downtown Plaza")
                 //   signalType -> lowercase       ("4-WAY"          -> "4-way")
@@ -117,12 +117,27 @@ public class IngestionServiceApp {
         return raw.toLowerCase();
     }
 
-    // --- Generic helpers -------------------------------------------------
+    // --- Whitespace normalization ----------------------------------------
 
-    private static String trimAllSpaces(String input) {
+    /**
+     * Normalize a raw CSV cell's whitespace:
+     *   - strip leading and trailing whitespace
+     *   - collapse runs of internal whitespace to a single space
+     *
+     * Unicode-aware via String#strip() + \p{javaWhitespace}+ so it also covers
+     * tabs, newlines, and non-ASCII spaces — not just the ASCII space character.
+     *
+     *   "  downtown  plaza  "   -> "downtown plaza"
+     *   "\tNorth\t\tSide\n"     -> "North Side"
+     *   "   "                    -> ""
+     *   null                     -> null
+     */
+    private static String normalizeWhitespace(String input) {
         if (input == null) return null;
-        return input.trim().replaceAll("\\s+", " ");
+        return input.strip().replaceAll("\\p{javaWhitespace}+", " ");
     }
+
+    // --- Generic helpers -------------------------------------------------
 
     private static boolean isMissingOrPlaceholder(String value) {
         if (value == null || value.isEmpty()) return true;
