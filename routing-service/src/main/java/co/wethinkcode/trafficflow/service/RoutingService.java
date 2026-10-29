@@ -1,210 +1,221 @@
-package co.wethinkcode.trafficflow.service;
+package co.wethinkcode.trafficflow;
 
-import co.wethinkcode.trafficflow.model.RouteRequest;
-import co.wethinkcode.trafficflow.model.RouteResponse;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import java.io.IOException;
+import io.javalin.Javalin;
+
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
-public class RoutingService {
+public class RoutingServiceApp {
 
-    // --- ETA model constants -------------------------------------------------
-    private static final int BASE_TIME_MINUTES = 10;
-    private static final int MINUTES_PER_CONGESTION_LEVEL = 2;
-    private static final int CLOSED_INTERSECTION_PENALTY_MINUTES = 30;
+    private static final int    PORT              = 7023;
+    private static final String INTERSECTION_BASE = "http://localhost:7021";
+    private static final String CONGESTION_BASE   = "http://localhost:7022";
 
-//
-//    int baseTime = 10;
-//    int estimatedTravelTime = baseTime + (congestionLevel * 2);
-    // --- HTTP client ---------------------------------------------------------
-    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(5);
-    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(5);
+    private static final double BASE_MINUTES = 5.0;
 
-    private static final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(CONNECT_TIMEOUT)
-            .build();
+    private static final Map<String, Double> SIGNAL_DELAY = Map.of(
+            "4-way",      2.0,
+            "2-way",      1.0,
+            "roundabout", 0.5);
+    private static final double DEFAULT_SIGNAL_DELAY = 1.5;
 
-    private static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final HttpClient   HTTP   = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(2)).build();
 
-    private final String intersectionServiceUrl;
-    private final String congestionServiceUrl;
+    public static void main(String[] args) {
+        Javalin app = Javalin.create().start(PORT);
 
-    public RoutingService(String intersectionServiceUrl, String congestionServiceUrl) {
-        this.intersectionServiceUrl = intersectionServiceUrl;
-        this.congestionServiceUrl = congestionServiceUrl;
-    }
+        // Catch-all error envelope.
+        app.exception(Exception.class, (e, ctx) -> {
+            System.err.println("[routing] unhandled exception: " + e);
+            e.printStackTrace();
+            ctx.status(500).json(Map.of("error", "internal server error"));
+        });
+        app.error(404, ctx -> ctx.status(404).json(
+                Map.of("error", "not found", "path", ctx.path())));
+        app.error(405, ctx -> ctx.status(405).json(
+                Map.of("error", "method not allowed",
+                        "method", ctx.req().getMethod(),
+                        "path",   ctx.path())));
 
-    public RouteResponse calculateRoute(RouteRequest request) {
-        // Both upstream calls still happen over HTTP.
-        IntersectionInfo fromInfo = validateIntersection(request.from);
-        IntersectionInfo toInfo   = validateIntersection(request.to);
-        int congestionLevel       = getCongestionLevel();
+        app.get("/health", ctx -> ctx.result("OK"));
 
-//        int estimatedTravelTime = baseTime + (congestionLevel * 2);
-
-        // ETA = base + congestion term + validity term
-        int congestionMinutes = congestionLevel * MINUTES_PER_CONGESTION_LEVEL;
-        int validityMinutes   = fromInfo.penaltyMinutes + toInfo.penaltyMinutes;
-        int estimatedTravelTime = BASE_TIME_MINUTES + congestionMinutes + validityMinutes;
-
-        return new RouteResponse(
-                request.from,
-                request.to,
-                congestionLevel,
-                estimatedTravelTime,
-                deriveStatus(fromInfo, toInfo)
-        );
-    }
-
-    // ------------------------------------------------------------------------
-    // Intersection lookup
-    // ------------------------------------------------------------------------
-//    private void validateIntersection(String intersectionId) { ... }
-    private IntersectionInfo validateIntersection(String intersectionId) {
-        HttpRequest httpRequest = HttpRequest.newBuilder()
-                .uri(URI.create(intersectionServiceUrl + "/intersections/" + intersectionId))
-                .timeout(REQUEST_TIMEOUT)
-                .GET()
-                .build();
-
-        HttpResponse<String> response;
-        try {
-            response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
-        } catch (IOException e) {
-            throw new RuntimeException("Error validating intersection: " + e.getMessage(), e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted while validating intersection", e);
-        }
-
-        if (response.statusCode() == 404) {
-            // Preserved original behaviour: missing intersection is fatal.
-            throw new IllegalArgumentException("Intersection not found: " + intersectionId);
-        }
-        if (response.statusCode() != 200) {
-            throw new RuntimeException("Failed to validate intersection: HTTP " + response.statusCode());
-        }
-
-        return parseIntersection(intersectionId, response.body());
-    }
-
-    /**
-     * Parse whatever the intersection service returns and extract a validity
-     * penalty. Unknown / empty bodies are treated as "open, no penalty".
-     *
-     * Recognised fields (all optional, any combination):
-     *   "closed": true                 -> adds CLOSED_INTERSECTION_PENALTY_MINUTES
-     *   "status": "closed"|"blocked"   -> adds CLOSED_INTERSECTION_PENALTY_MINUTES
-     *   "valid": false                 -> adds CLOSED_INTERSECTION_PENALTY_MINUTES
-     *   "penaltyMinutes": <int>        -> added verbatim
-     *   "delayMinutes":   <int>        -> added verbatim
-     */
-
-    private IntersectionInfo parseIntersection(String intersectionId, String body) {
-        boolean closed = false;
-        int penaltyMinutes = 0;
-
-        try {
-            JsonNode node = objectMapper.readTree(body);
-            if (node != null && !node.isMissingNode()) {
-                if (node.hasNonNull("closed") && node.get("closed").asBoolean()) {
-                    closed = true;
-                }
-                if (node.hasNonNull("valid") && !node.get("valid").asBoolean()) {
-                    closed = true;
-                }
-                if (node.hasNonNull("status")) {
-                    String s = node.get("status").asText("");
-                    if ("closed".equalsIgnoreCase(s) || "blocked".equalsIgnoreCase(s)
-                            || "invalid".equalsIgnoreCase(s)) {
-                        closed = true;
-                    }
-                }
-                if (node.hasNonNull("penaltyMinutes")) {
-                    penaltyMinutes += Math.max(0, node.get("penaltyMinutes").asInt(0));
-                }
-                if (node.hasNonNull("delayMinutes")) {
-                    penaltyMinutes += Math.max(0, node.get("delayMinutes").asInt(0));
-                }
+        app.get("/route", ctx -> {
+            String rawFrom = ctx.queryParam("from");
+            String rawTo   = ctx.queryParam("to");
+            if (rawFrom == null || rawFrom.isBlank()
+                    || rawTo   == null || rawTo.isBlank()) {
+                ctx.status(400).json(Map.of(
+                        "error", "query params 'from' and 'to' required"));
+                return;
             }
-        } catch (IOException e) {
-            // Not JSON / unparseable -> treat as "open, no extra info"
-        }
+            String from = rawFrom.trim().toUpperCase();
+            String to   = rawTo.trim().toUpperCase();
+            if (from.equals(to)) {
+                ctx.status(400).json(Map.of(
+                        "error", "'from' and 'to' must differ"));
+                return;
+            }
 
-        if (closed) {
-            penaltyMinutes += CLOSED_INTERSECTION_PENALTY_MINUTES;
-        }
+            Intersection fromIx, toIx;
+            try {
+                fromIx = fetchIntersection(from);
+                if (fromIx == null) {
+                    ctx.status(404).json(Map.of(
+                            "error", "intersection not found: " + from));
+                    return;
+                }
+                toIx = fetchIntersection(to);
+                if (toIx == null) {
+                    ctx.status(404).json(Map.of(
+                            "error", "intersection not found: " + to));
+                    return;
+                }
+            } catch (DependencyException e) {
+                ctx.status(502).json(Map.of(
+                        "error",  "intersection-service unavailable",
+                        "detail", e.getMessage()));
+                return;
+            }
 
-        return new IntersectionInfo(intersectionId, closed, penaltyMinutes);
+            if (Boolean.FALSE.equals(fromIx.active)) {
+                ctx.status(409).json(Map.of(
+                        "error", "origin intersection is inactive: " + from));
+                return;
+            }
+            if (Boolean.FALSE.equals(toIx.active)) {
+                ctx.status(409).json(Map.of(
+                        "error", "destination intersection is inactive: " + to));
+                return;
+            }
+
+            int level;
+            try {
+                level = fetchCongestionLevel();
+            } catch (DependencyException e) {
+                ctx.status(502).json(Map.of(
+                        "error",  "congestion-service unavailable",
+                        "detail", e.getMessage()));
+                return;
+            }
+
+            double multiplier = 1.0 + level * 0.25;
+            double fromDelay  = signalDelay(fromIx.signalType);
+            double toDelay    = signalDelay(toIx.signalType);
+            double estimate   = (BASE_MINUTES + fromDelay + toDelay) * multiplier;
+
+            List<String> warnings = new ArrayList<>();
+            if (fromIx.active     == null) warnings.add("origin active status unknown");
+            if (toIx.active       == null) warnings.add("destination active status unknown");
+            if (fromIx.signalType == null) warnings.add("origin signal type unknown");
+            if (toIx.signalType   == null) warnings.add("destination signal type unknown");
+
+            Map<String, Object> breakdown = new HashMap<>();
+            breakdown.put("baseMinutes",            BASE_MINUTES);
+            breakdown.put("congestionLevel",        level);
+            breakdown.put("congestionMultiplier",   multiplier);
+            breakdown.put("fromSignalDelayMinutes", fromDelay);
+            breakdown.put("toSignalDelayMinutes",   toDelay);
+
+            Map<String, Object> resp = new HashMap<>();
+            resp.put("from",             from);
+            resp.put("to",               to);
+            resp.put("estimatedMinutes", Math.round(estimate * 10.0) / 10.0);
+            resp.put("breakdown",        breakdown);
+            if (!warnings.isEmpty()) resp.put("warnings", warnings);
+            ctx.json(resp);
+        });
     }
 
-    // ------------------------------------------------------------------------
-    // Congestion lookup
-    // ------------------------------------------------------------------------
-    private int getCongestionLevel() {
-        HttpRequest httpRequest = HttpRequest.newBuilder()
-                .uri(URI.create(congestionServiceUrl + "/congestion"))
-                .timeout(REQUEST_TIMEOUT)
-                .GET()
-                .build();
-
-        HttpResponse<String> response;
+    private static Intersection fetchIntersection(String id) throws DependencyException {
+        // URL-encode the id so an unusual id can't blow up URI.create().
+        String encoded = URLEncoder.encode(id, StandardCharsets.UTF_8);
+        HttpResponse<String> resp = get(
+                INTERSECTION_BASE + "/intersections/" + encoded,
+                "intersection-service");
+        if (resp.statusCode() == 404) return null;
+        if (resp.statusCode() == 503) {
+            throw new DependencyException("intersection data not loaded downstream");
+        }
+        if (resp.statusCode() != 200) {
+            throw new DependencyException("HTTP " + resp.statusCode());
+        }
         try {
-            response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
-        } catch (IOException e) {
-            throw new RuntimeException("Error getting congestion level: " + e.getMessage(), e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted while getting congestion level", e);
+            return MAPPER.readValue(resp.body(), Intersection.class);
+        } catch (Exception e) {
+            throw new DependencyException("bad JSON: " + e.getMessage());
         }
+    }
 
-        if (response.statusCode() != 200) {
-            throw new RuntimeException("Failed to get congestion level: HTTP " + response.statusCode());
+    private static int fetchCongestionLevel() throws DependencyException {
+        HttpResponse<String> resp = get(CONGESTION_BASE + "/congestion",
+                "congestion-service");
+        if (resp.statusCode() != 200) {
+            throw new DependencyException("HTTP " + resp.statusCode());
         }
-
         try {
-            CongestionResponse congestionResponse =
-                    objectMapper.readValue(response.body(), CongestionResponse.class);
-            return congestionResponse.level;
-        } catch (IOException e) {
-            throw new RuntimeException("Error parsing congestion level: " + e.getMessage(), e);
+            JsonNode root  = MAPPER.readTree(resp.body());
+            JsonNode level = root.get("level");
+            if (level == null || !level.isInt()) {
+                throw new DependencyException("response missing integer 'level'");
+            }
+            return level.asInt();
+        } catch (DependencyException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new DependencyException("bad JSON: " + e.getMessage());
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Status derivation
-    // ------------------------------------------------------------------------
-    private static String deriveStatus(IntersectionInfo from, IntersectionInfo to) {
-        if (from.closed || to.closed) {
-            return "restricted";
+    private static HttpResponse<String> get(String url, String name)
+            throws DependencyException {
+        HttpRequest req;
+        try {
+            req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(5))
+                    .GET().build();
+        } catch (IllegalArgumentException e) {
+            // Malformed URL — treat as a dependency error, not a 500.
+            throw new DependencyException(name + " request URL malformed: "
+                    + e.getMessage());
         }
-        if (from.penaltyMinutes > 0 || to.penaltyMinutes > 0) {
-            return "restricted";
+        try {
+            return HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            throw new DependencyException(name + " connection failed: "
+                    + e.getMessage());
         }
-        return "valid";
     }
 
-    // ------------------------------------------------------------------------
-    // DTOs
-    // ------------------------------------------------------------------------
-    private static class CongestionResponse {
-        public int level;
+    private static double signalDelay(String signalType) {
+        if (signalType == null) return DEFAULT_SIGNAL_DELAY;
+        Double d = SIGNAL_DELAY.get(signalType.toLowerCase());
+        return d != null ? d : DEFAULT_SIGNAL_DELAY;
     }
 
-    public static class IntersectionInfo {
-        public final String id;
-        public final boolean closed;
-        public final int penaltyMinutes;
+    public static class Intersection {
+        public String       id;
+        public String       district;
+        public String       signalType;
+        public Boolean      active;
+        public List<String> missingFields;
+        public Intersection() {}
+    }
 
-        public IntersectionInfo(String id, boolean closed, int penaltyMinutes) {
-            this.id = id;
-            this.closed = closed;
-            this.penaltyMinutes = penaltyMinutes;
-        }
+    static class DependencyException extends Exception {
+        DependencyException(String msg) { super(msg); }
     }
 }
