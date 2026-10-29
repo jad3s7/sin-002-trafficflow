@@ -12,10 +12,10 @@ import java.util.HashMap;
 public class IngestionServiceApp {
 
     // Class-level variable to store the cleaned, deduplicated intersection data
-    // This allows the data to be accessible by the REST endpoint
+    // so it can be served by the REST endpoint.
     private static List<Intersection> finalCleanedData = new ArrayList<>();
 
-    // Simple data class to hold cleaned intersection record
+    // Simple data class to hold a cleaned intersection record.
     static class Intersection {
         String id;
         String district;
@@ -39,134 +39,129 @@ public class IngestionServiceApp {
 
     public static void main(String[] args) {
         Javalin app = Javalin.create().start(7020);
-
         app.get("/health", ctx -> ctx.result("OK"));
 
-        // Line 1: Open CSV file from resources
-        // Opened the intersections-legacy.csv file from the resources folder using ClassLoader
-        // to get an InputStream, which can be used to read the CSV data
         InputStream csvStream = IngestionServiceApp.class.getClassLoader()
                 .getResourceAsStream("intersections-legacy.csv");
 
-        // Line 2: Read the header row to identify column names
-        // Wrapped the InputStream in a BufferedReader to read the file line by line
-        // Read the first line (header) and split it by comma to get column names
         BufferedReader reader = new BufferedReader(new InputStreamReader(csvStream));
         try {
-            String headerLine = reader.readLine();
-            String[] columnNames = headerLine.split(",");
+            // Consume the header row.
+            reader.readLine();
 
-            // Line 3: For each data row:
-            // Extract raw values for intersection_id, district, signal_type, active_flag
-            // Apply trimming to remove whitespace
-            // Apply casing normalization (IDs to uppercase, names to title case)
-            // Parse boolean flag using a mapping function
-            // Store cleaned record in a collection
             List<Intersection> cleanedRecords = new ArrayList<>();
             String line;
             while ((line = reader.readLine()) != null) {
                 String[] values = line.split(",");
 
-                // Extract raw values (handling potential array index issues)
-                String rawId = values.length > 0 ? values[0] : "";
-                String rawDistrict = values.length > 1 ? values[1] : "";
+                String rawId         = values.length > 0 ? values[0] : "";
+                String rawDistrict   = values.length > 1 ? values[1] : "";
                 String rawSignalType = values.length > 2 ? values[2] : "";
                 String rawActiveFlag = values.length > 3 ? values[3] : "";
 
-                // Apply trimming to remove whitespace (leading, trailing, and double spaces)
-                String trimmedId = trimAllSpaces(rawId);
-                String trimmedDistrict = trimAllSpaces(rawDistrict);
+                // Trim padding / collapse double spaces first.
+                String trimmedId         = trimAllSpaces(rawId);
+                String trimmedDistrict   = trimAllSpaces(rawDistrict);
                 String trimmedSignalType = trimAllSpaces(rawSignalType);
                 String trimmedActiveFlag = trimAllSpaces(rawActiveFlag);
 
-                // Check for empty strings and placeholder values in district and signal type fields
-                // before applying casing normalization - return null for these cases
-                String normalizedDistrict = isMissingOrPlaceholder(trimmedDistrict) ? null : toTitleCase(trimmedDistrict);
-                String normalizedSignalType = isMissingOrPlaceholder(trimmedSignalType) ? null : trimmedSignalType.toLowerCase();
+                // Casing normalization — collapse each field to one canonical form:
+                //   id         -> UPPERCASE       ("int-1001"       -> "INT-1001")
+                //   district   -> Title Case      ("DOWNTOWN plaza" -> "Downtown Plaza")
+                //   signalType -> lowercase       ("4-WAY"          -> "4-way")
+                String normalizedId         = normalizeId(trimmedId);
+                String normalizedDistrict   = normalizeDistrict(trimmedDistrict);
+                String normalizedSignalType = normalizeSignalType(trimmedSignalType);
 
-                // Apply casing normalization (IDs to uppercase)
-                String normalizedId = trimmedId.toUpperCase();
-
-                // Parse boolean flag using a mapping function
                 Boolean normalizedActive = normalizeBoolean(trimmedActiveFlag);
 
-                // Store cleaned record in a collection
-                Intersection record = new Intersection(
-                    normalizedId,
-                    normalizedDistrict,
-                    normalizedSignalType,
-                    normalizedActive
-                );
-                cleanedRecords.add(record);
+                cleanedRecords.add(new Intersection(
+                        normalizedId,
+                        normalizedDistrict,
+                        normalizedSignalType,
+                        normalizedActive
+                ));
             }
 
-            // Line 4: Remove duplicates by normalizing IDs and comparing other fields
-            // Use a Map with normalized ID as key to automatically handle duplicates
-            // If the same ID appears again (with different casing), only keep one record
-            Map<String, Intersection> deduplicatedMap = new HashMap<>();
+            // Deduplicate by (already-normalized) id — first occurrence wins.
+            Map<String, Intersection> deduplicated = new HashMap<>();
             for (Intersection record : cleanedRecords) {
-                String normalizedId = record.id.toUpperCase();
-                // Only add if not already present (first occurrence wins)
-                if (!deduplicatedMap.containsKey(normalizedId)) {
-                    deduplicatedMap.put(normalizedId, record);
-                }
+                deduplicated.putIfAbsent(record.id, record);
             }
-            // Convert map values back to a list
-            List<Intersection> deduplicatedRecords = new ArrayList<>(deduplicatedMap.values());
-
-            // Line 5: Return the cleaned, deduplicated list
-            // Store the final cleaned and deduplicated data in the class-level variable
-            // so it can be accessed by the REST endpoint for other services to consume
-            finalCleanedData = deduplicatedRecords;
+            finalCleanedData = new ArrayList<>(deduplicated.values());
 
         } catch (Exception e) {
             e.printStackTrace();
         }
 
-        // Expose the cleaned data via REST endpoint for other services to consume
+        // Expose cleaned data for other services to consume.
         app.get("/intersections", ctx -> ctx.json(finalCleanedData));
     }
 
-    // Helper method to trim all spaces (leading, trailing, and double spaces)
+    // --- Casing normalization helpers ------------------------------------
+
+    /** IDs -> UPPERCASE, so "int-1001" and "INT-1001" collapse to one form. */
+    private static String normalizeId(String raw) {
+        return raw == null ? "" : raw.toUpperCase();
+    }
+
+    /** Districts -> per-word Title Case, e.g. "DOWNTOWN plaza" -> "Downtown Plaza". */
+    private static String normalizeDistrict(String raw) {
+        if (isMissingOrPlaceholder(raw)) return null;
+        return toTitleCase(raw);
+    }
+
+    /** Signal types -> lowercase, so "4-WAY" and "4-way" collapse to one form. */
+    private static String normalizeSignalType(String raw) {
+        if (isMissingOrPlaceholder(raw)) return null;
+        return raw.toLowerCase();
+    }
+
+    // --- Generic helpers -------------------------------------------------
+
     private static String trimAllSpaces(String input) {
-        if (input == null) {
-            return null;
-        }
+        if (input == null) return null;
         return input.trim().replaceAll("\\s+", " ");
     }
 
-    // Helper method to check if a value is missing or a placeholder
-    // Returns true for empty strings, null, or known placeholder values
     private static boolean isMissingOrPlaceholder(String value) {
-        if (value == null || value.isEmpty()) {
-            return true;
-        }
+        if (value == null || value.isEmpty()) return true;
         String normalized = value.toLowerCase();
-        return normalized.equals("unknown") ||
-               normalized.equals("n/a") ||
-               normalized.equals("tbd") ||
-               normalized.equals("-") ||
-               normalized.equals("nan");
+        return normalized.equals("unknown")
+                || normalized.equals("n/a")
+                || normalized.equals("tbd")
+                || normalized.equals("-")
+                || normalized.equals("nan");
     }
 
-    // Helper method to convert string to title case
+    /**
+     * Title-case each whitespace-separated word:
+     *   "DOWNTOWN"        -> "Downtown"
+     *   "DOWNTOWN plaza"  -> "Downtown Plaza"
+     *   "north side"      -> "North Side"
+     */
     private static String toTitleCase(String input) {
-        if (input == null || input.isEmpty()) {
-            return null;
+        if (input == null || input.isEmpty()) return null;
+        String[] words = input.toLowerCase().split("\\s+");
+        StringBuilder sb = new StringBuilder(input.length());
+        for (String word : words) {
+            if (word.isEmpty()) continue;
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(Character.toUpperCase(word.charAt(0)));
+            sb.append(word.substring(1));
         }
-        return input.substring(0, 1).toUpperCase() + input.substring(1).toLowerCase();
+        return sb.toString();
     }
 
-    // Helper method to normalize boolean values
     private static Boolean normalizeBoolean(String flag) {
-        if (isMissingOrPlaceholder(flag)) {
-            return null;
-        }
+        if (isMissingOrPlaceholder(flag)) return null;
         String normalized = flag.toLowerCase();
-        if (normalized.equals("y") || normalized.equals("yes") || normalized.equals("1") || normalized.equals("true")) {
+        if (normalized.equals("y") || normalized.equals("yes")
+                || normalized.equals("1") || normalized.equals("true")) {
             return true;
         }
-        if (normalized.equals("n") || normalized.equals("no") || normalized.equals("0") || normalized.equals("false")) {
+        if (normalized.equals("n") || normalized.equals("no")
+                || normalized.equals("0") || normalized.equals("false")) {
             return false;
         }
         return null;
