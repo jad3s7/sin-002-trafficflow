@@ -22,19 +22,33 @@ public class IngestionServiceApp {
         String signalType;
         Boolean active;
 
-        Intersection() {}
+        // Names of the fields that were missing or placeholder in the source row.
+        // Empty list == complete record. Populated in the constructor so every
+        // Intersection (including merged ones) automatically has an accurate
+        // missing-fields description.
+        List<String> missingFields;
+
+        Intersection() {
+            this.missingFields = new ArrayList<>();
+        }
 
         Intersection(String id, String district, String signalType, Boolean active) {
             this.id = id;
             this.district = district;
             this.signalType = signalType;
             this.active = active;
+            this.missingFields = new ArrayList<>();
+            if (id == null || id.isEmpty())          missingFields.add("id");
+            if (district == null)                     missingFields.add("district");
+            if (signalType == null)                   missingFields.add("signalType");
+            if (active == null)                       missingFields.add("active");
         }
 
-        public String getId() { return id; }
-        public String getDistrict() { return district; }
-        public String getSignalType() { return signalType; }
-        public Boolean getActive() { return active; }
+        public String getId()                   { return id; }
+        public String getDistrict()             { return district; }
+        public String getSignalType()           { return signalType; }
+        public Boolean getActive()              { return active; }
+        public List<String> getMissingFields()  { return missingFields; }
     }
 
     public static void main(String[] args) {
@@ -65,27 +79,43 @@ public class IngestionServiceApp {
                 String trimmedSignalType = normalizeWhitespace(rawSignalType);
                 String trimmedActiveFlag = normalizeWhitespace(rawActiveFlag);
 
-                // Step 1: casing normalization — collapse each field to one form:
-                //   id         -> UPPERCASE       ("int-1001"       -> "INT-1001")
-                //   district   -> Title Case      ("DOWNTOWN plaza" -> "Downtown Plaza")
-                //   signalType -> lowercase       ("4-WAY"          -> "4-way")
+                // Step 1 + Step 4: casing normalization, where missing and
+                // placeholder values are mapped to null (not guessed).
+                //   id         -> UPPERCASE  (null if missing/placeholder)
+                //   district   -> Title Case (null if missing/placeholder)
+                //   signalType -> lowercase  (null if missing/placeholder)
+                //   active     -> Boolean    (null if missing/placeholder)
                 String normalizedId         = normalizeId(trimmedId);
                 String normalizedDistrict   = normalizeDistrict(trimmedDistrict);
                 String normalizedSignalType = normalizeSignalType(trimmedSignalType);
+                Boolean normalizedActive    = normalizeBoolean(trimmedActiveFlag);
 
-                Boolean normalizedActive = normalizeBoolean(trimmedActiveFlag);
-
-                cleanedRecords.add(new Intersection(
+                // Step 4: the constructor computes missingFields automatically.
+                Intersection record = new Intersection(
                         normalizedId,
                         normalizedDistrict,
                         normalizedSignalType,
                         normalizedActive
-                ));
+                );
+                if (!record.missingFields.isEmpty()) {
+                    System.out.println("[ingestion] incomplete record id="
+                            + (record.id == null ? "<none>" : record.id)
+                            + " missing=" + record.missingFields);
+                }
+                cleanedRecords.add(record);
             }
 
             // Step 3: detect and collapse duplicate records for the same
-            // real-world intersection. See `deduplicate` for the strategy.
+            // real-world intersection.
             finalCleanedData = deduplicate(cleanedRecords);
+
+            // Step 4 summary: how many of the rows we couldn't fully trust.
+            long incomplete = finalCleanedData.stream()
+                    .filter(r -> !r.missingFields.isEmpty())
+                    .count();
+            System.out.println("[ingestion] parsed " + cleanedRecords.size()
+                    + " rows; " + finalCleanedData.size() + " unique intersections; "
+                    + incomplete + " incomplete");
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -112,11 +142,12 @@ public class IngestionServiceApp {
     private static List<Intersection> deduplicate(List<Intersection> records) {
         // Pass 1: collapse on normalized id.
         Map<String, Intersection> byId = new LinkedHashMap<>();
+        int anonIdCounter = 0;
         for (Intersection r : records) {
             if (r.id == null || r.id.isEmpty()) {
-                // No id — nothing to key on; let it through to the
-                // fingerprint pass below (which will also skip it).
-                byId.put("__anon__" + byId.size(), r);
+                // No id — nothing to key on; give it a unique bucket so
+                // multiple id-less records don't accidentally collapse.
+                byId.put("__anon__" + (anonIdCounter++), r);
                 continue;
             }
             Intersection existing = byId.get(r.id);
@@ -130,12 +161,17 @@ public class IngestionServiceApp {
 
         // Pass 2: collapse on (district, signalType) across differing ids.
         Map<String, Intersection> byFingerprint = new LinkedHashMap<>();
+        int anonFpCounter = 0;
         for (Intersection r : byId.values()) {
             String fp = fingerprint(r);
             if (fp == null) {
                 // No usable fingerprint (district or signalType missing) —
-                // we can't confidently say it's a duplicate, so keep it.
-                byFingerprint.put("__id__:" + r.id, r);
+                // we can't confidently say it's a duplicate, so keep it
+                // under a unique key (id if present, else a counter).
+                String key = (r.id != null)
+                        ? ("__id__:" + r.id)
+                        : ("__anonfp__" + (anonFpCounter++));
+                byFingerprint.put(key, r);
                 continue;
             }
             Intersection existing = byFingerprint.get(fp);
@@ -163,7 +199,7 @@ public class IngestionServiceApp {
     }
 
     /**
-     * Combine two records that have been classified as duplicates:
+     * Combine two records classified as duplicates:
      *   - keep the earlier record's non-null values
      *   - fill any nulls from the later record
      *   - log any non-null conflict so it's visible in the ingestion output
@@ -198,14 +234,22 @@ public class IngestionServiceApp {
                     + " — keeping " + earlier.active);
         }
 
+        // Constructor recomputes missingFields from the merged values, so
+        // filling a null from the later record correctly removes it from
+        // the missingFields list.
         return new Intersection(id, district, signalType, active);
     }
 
     // --- Casing normalization helpers ------------------------------------
 
-    /** IDs -> UPPERCASE, so "int-1001" and "INT-1001" collapse to one form. */
+    /**
+     * IDs -> UPPERCASE. Missing / placeholder id becomes null so the
+     * record is explicitly marked as having no id rather than silently
+     * getting an empty string.
+     */
     private static String normalizeId(String raw) {
-        return raw == null ? "" : raw.toUpperCase();
+        if (isMissingOrPlaceholder(raw)) return null;
+        return raw.toUpperCase();
     }
 
     /** Districts -> per-word Title Case, e.g. "DOWNTOWN plaza" -> "Downtown Plaza". */
@@ -229,11 +273,6 @@ public class IngestionServiceApp {
      *
      * Unicode-aware via String#strip() + \p{javaWhitespace}+ so it also covers
      * tabs, newlines, and non-ASCII spaces — not just the ASCII space character.
-     *
-     *   "  downtown  plaza  "   -> "downtown plaza"
-     *   "\tNorth\t\tSide\n"     -> "North Side"
-     *   "   "                    -> ""
-     *   null                     -> null
      */
     private static String normalizeWhitespace(String input) {
         if (input == null) return null;
@@ -242,6 +281,11 @@ public class IngestionServiceApp {
 
     // --- Generic helpers -------------------------------------------------
 
+    /**
+     * Explicit list of "we have no real value for this cell" indicators.
+     * Anything matching one of these is treated as missing and is NOT
+     * guessed at — the field is set to null and recorded in missingFields.
+     */
     private static boolean isMissingOrPlaceholder(String value) {
         if (value == null || value.isEmpty()) return true;
         String normalized = value.toLowerCase();
@@ -249,14 +293,17 @@ public class IngestionServiceApp {
                 || normalized.equals("n/a")
                 || normalized.equals("tbd")
                 || normalized.equals("-")
-                || normalized.equals("nan");
+                || normalized.equals("nan")
+                || normalized.equals("null")
+                || normalized.equals("nil")
+                || normalized.equals("none")
+                || normalized.equals("undefined");
     }
 
     /**
      * Title-case each whitespace-separated word:
      *   "DOWNTOWN"        -> "Downtown"
      *   "DOWNTOWN plaza"  -> "Downtown Plaza"
-     *   "north side"      -> "North Side"
      */
     private static String toTitleCase(String input) {
         if (input == null || input.isEmpty()) return null;
