@@ -161,7 +161,7 @@ To add real tests to a module, add JUnit 5 and Surefire to its `pom.xml`:
 ```
 
 then add tests under that module's `src/test/java/...` and run:
-
+https://youtu.be/U2qkqdWJDv0
 ```
 mvn test
 ```
